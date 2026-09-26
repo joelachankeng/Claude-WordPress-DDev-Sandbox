@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "model": "opus",
+  "permissions": {
+    "deny": [
+      "Read(.env)",
+      "Read(.env.*)",
+      "Read(**/.env)",
+      "Read(**/.env.*)",
+      "Bash(cat *.env*)",
+      "Bash(less *.env*)",
+      "Bash(more *.env*)",
+      "Bash(head *.env*)",
+      "Bash(tail *.env*)",
+      "Bash(nano *.env*)",
+      "Bash(vim *.env*)",
+      "Bash(vi *.env*)",
+      "Bash(xxd *.env*)",
+      "Bash(od *.env*)",
+      "Bash(strings *.env*)",
+      "Bash(hexdump *.env*)",
+      "Bash(grep *.env*)",
+      "Bash(awk *.env*)",
+      "Bash(sed *.env*)",
+      "Bash(perl *.env*)",
+      "Bash(python *.env*)",
+      "Bash(ruby *.env*)",
+      "Bash(type *.env*)",
+      "Bash(find *.env*)",
+      "Bash(cp *.env*)",
+      "Bash(mv *.env*)",
+      "Bash(rm *.env*)",
+      "Bash(tar *.env*)",
+      "Bash(zip *.env*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "if command -v powershell >/dev/null 2>&1; then powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/deny-env-reads.ps1\"; fi",
+            "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "if command -v jq >/dev/null 2>&1; then sh \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/deny-env-reads.sh\"; fi",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

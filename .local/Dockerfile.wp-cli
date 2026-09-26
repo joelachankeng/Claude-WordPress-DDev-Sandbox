@@ -1,0 +1,17 @@
+FROM wordpress:cli
+
+# The upstream image installs `imagemagick-libs` but not `imagemagick`, which
+# is the package carrying the coder modules. The result is an Imagick that
+# loads fine and reports a version, yet has ZERO delegates:
+# Imagick::queryFormats() returns an empty array and every read/write throws
+# "no decode delegate for this image format".
+#
+# WordPress quietly falls back to GD when it sees that, so media commands still
+# work — which is exactly what makes it easy to miss. Installing the package
+# restores the full delegate set (~200 formats) and lets this service match the
+# wordpress and claude containers.
+USER root
+RUN apk add --no-cache imagemagick
+
+# Back to the image's own user; wp-cli refuses to run some commands as root.
+USER www-data

@@ -1,0 +1,18 @@
+# Local Sandbox #
+################
+#.cursorignore
+#.claude
+#.local
+.env
+.env.*
+!.env.example
+.claude-sessions/
+.playwright-mcp
+#.sass
+!.sass/SASS.settings.json
+!.sass/SASS.settings.example.json
+wp-config.local.php
+/wp-content/mu-plugins/local-mu-plugins/
+/wp-content/mu-plugins/00-local-mu-plugins.php
+/wp-content/mu-plugins/[0-9][0-9]-sandbox-*.php
+#CLAUDE.md

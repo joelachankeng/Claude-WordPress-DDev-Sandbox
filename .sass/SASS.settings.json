@@ -1,0 +1,14 @@
+{
+  "defaults": {
+    "style": "compressed",
+    "sourceMap": true,
+    "extensionName": ".min.css",
+    "autoprefixer": true
+  },
+  "compilations": [
+    {
+      "input": "wp-content/themes/your-theme/scss",
+      "output": "wp-content/themes/your-theme/css"
+    }
+  ]
+}

@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # sass.sh — compile or watch SCSS using .sass/SASS.settings.json.
 #
-# Works in two contexts:
-#   * From the host (WSL shell): spins up the `sass` compose service (defined
-#     in .local/docker-compose.yml) and runs the node runner inside it.
-#   * From inside the claude container (e.g. when Claude calls this script):
-#     runs the node runner directly — sass/postcss/autoprefixer are already
-#     baked into the image, so no docker call is needed.
+# The compile itself always happens in the DDEV web container, which is where
+# the pinned toolchain lives (sass/postcss/autoprefixer, installed by
+# .ddev/web-build/Dockerfile and found through NODE_PATH). The script works from
+# either side of the container boundary:
+#
+#   * From the host: hands off with `ddev exec`.
+#   * From inside the web container (`ddev ssh`): runs the node runner directly.
 #
 # Usage:
 #   ./.sass/sass.sh compile      # compile every entry once, exit
@@ -15,7 +16,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMPOSE_DIR="$PROJECT_ROOT/.local"
 
 MODE="${1:-}"
 case "$MODE" in
@@ -39,26 +39,46 @@ EOF
     ;;
 esac
 
-# In-container shortcut: if we're already inside a docker container that has
-# node + sass available, just run the node runner directly.
-if [[ -f /.dockerenv ]] && command -v node >/dev/null 2>&1 && [[ -d /workspace/.sass ]]; then
-  exec node /workspace/.sass/sass-runner.js "$MODE"
+# --- Already inside the DDEV web container: run the runner directly. ---------
+# NODE_PATH is baked into the image by .ddev/web-build/Dockerfile, but set it
+# explicitly as a fallback so this still works if the environment is stripped
+# (cron, a bare `docker exec`, etc).
+if [[ "${IS_DDEV_PROJECT:-}" == "true" ]]; then
+  export NODE_PATH="${NODE_PATH:-/usr/local/lib/sandbox-sass/node_modules}"
+  exec node "$PROJECT_ROOT/.sass/sass-runner.js" "$MODE"
 fi
 
-# Otherwise we're on the host: use docker compose to run the sass service.
-if ! command -v docker >/dev/null 2>&1; then
-  echo "[sass.sh] docker not found. Install Docker Desktop or run this from inside the claude container." >&2
+# --- On the host: hand off to the web container. -----------------------------
+if ! command -v ddev >/dev/null 2>&1; then
+  echo "[sass.sh] ddev not found on PATH." >&2
+  echo "          Install DDEV, or run this from inside the web container (ddev ssh)." >&2
   exit 2
 fi
 
-# Per-project COMPOSE_PROJECT_NAME — must match the start scripts & compose.sh.
-export COMPOSE_PROJECT_NAME="$(printf '%s' "${PROJECT_ROOT##*/}" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_-' '-')-claude"
+cd "$PROJECT_ROOT"
 
-# Make sure the shared image exists before docker compose tries to use it.
-if ! docker image inspect claude-dangerous:latest >/dev/null 2>&1; then
-  echo "[sass.sh] Image claude-dangerous:latest not found — building..."
-  ( cd "$COMPOSE_DIR" && docker compose --profile sass build sass )
+if [[ ! -f .ddev/config.yaml ]]; then
+  echo "[sass.sh] No .ddev/config.yaml in $PROJECT_ROOT." >&2
+  echo "          Configure the project first: .local/site-control.sh option 1." >&2
+  exit 2
 fi
 
-exec docker compose -f "$COMPOSE_DIR/docker-compose.yml" --profile sass run --rm sass \
-  node /workspace/.sass/sass-runner.js "$MODE"
+# `ddev exec` fails fast on a stopped project rather than starting one, so say
+# something useful instead of leaking its error.
+if ! ddev exec true >/dev/null 2>&1; then
+  echo "[sass.sh] The DDEV site isn't running. Start it with 'ddev start'" >&2
+  echo "          (or .local/site-control.sh option 1) and try again." >&2
+  exit 2
+fi
+
+# In watch mode Ctrl+C has to reach node inside the container. `ddev exec`
+# forwards SIGINT to the process it started, so watch mode stops cleanly.
+#
+# $MODE is interpolated into the command string rather than passed as a positional
+# argument: `ddev exec` joins everything it is given into a single shell string,
+# so a trailing `-- "$MODE"` never arrives as $1 inside the container. This is
+# safe because the case statement at the top has already narrowed $MODE to the
+# literal "compile" or "watch". NODE_PATH and DDEV_APPROOT are escaped so they
+# expand in the container, not here.
+exec ddev exec bash -c \
+  "export NODE_PATH=\"\${NODE_PATH:-/usr/local/lib/sandbox-sass/node_modules}\"; exec node \"\$DDEV_APPROOT/.sass/sass-runner.js\" $MODE"

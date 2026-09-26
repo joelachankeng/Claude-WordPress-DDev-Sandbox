@@ -2,8 +2,9 @@
 /*
  * sass-runner.js — reads .sass/SASS.settings.json and compiles/watches SCSS.
  *
- * Invoked by .sass/sass.sh. Runs inside the claude/sass container, where
- * `sass`, `postcss`, and `autoprefixer` are baked into the image.
+ * Invoked by .sass/sass.sh, which runs it inside the DDEV web container.
+ * `sass`, `postcss` and `autoprefixer` are baked into that image by
+ * .ddev/web-build/Dockerfile and found via NODE_PATH.
  *
  * Usage:
  *   node sass-runner.js compile   # one-shot
@@ -23,7 +24,9 @@
  *     ]
  *   }
  *
- * Paths are resolved relative to PROJECT_ROOT (/workspace inside the container).
+ * Paths are resolved relative to PROJECT_ROOT, which is derived from this
+ * file's own location (.sass/..). That makes it correct both inside the web
+ * container (/var/www/html) and on the host, without hardcoding either.
  */
 
 const fs = require('fs');
@@ -41,7 +44,10 @@ try {
   process.exit(2);
 }
 
-const PROJECT_ROOT = '/workspace';
+// Derived from this file's location rather than hardcoded: under Docker this
+// was always /workspace, but DDEV mounts the project at /var/www/html and the
+// same script is useful straight from the host.
+const PROJECT_ROOT = path.resolve(__dirname, '..');
 const SETTINGS_PATH = path.join(PROJECT_ROOT, '.sass', 'SASS.settings.json');
 const EXAMPLE_PATH = path.join(PROJECT_ROOT, '.sass', 'SASS.settings.example.json');
 

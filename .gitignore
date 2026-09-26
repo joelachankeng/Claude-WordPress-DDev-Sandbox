@@ -6,12 +6,30 @@
 .env
 .env.*
 !.env.example
-.claude-sessions/
 .playwright-mcp
+
+# Persistent profile for the headed Playwright browser. One per project, so
+# several sandboxes can each have a browser open at the same time without
+# Chromium's "Browser is already in use" profile lock. Holds cookies and
+# logged-in sessions, so it stays out of git.
+.local/.playwright-profile/
+
 #.sass
 !.sass/SASS.settings.json
 !.sass/SASS.settings.example.json
-wp-config.local.php
+
+# DDEV generates both of these itself and marks them #ddev-generated, so they
+# are rebuilt on every start and never worth committing here.
+#
+# NOTE: when you drop this scaffolding into a real WordPress project, delete the
+# wp-config.php line — there, wp-config.php is the project's own file and
+# belongs in version control. Only wp-config-ddev.php stays ignored.
+wp-config.php
+wp-config-ddev.php
+
+# Installed on every container start by
+# .ddev/web-entrypoint.d/10-sandbox-mu-plugins.sh. Edit the sources in
+# .local/wp-mu-plugins/ instead; these copies are regenerated and deleted freely.
 /wp-content/mu-plugins/local-mu-plugins/
 /wp-content/mu-plugins/00-local-mu-plugins.php
 /wp-content/mu-plugins/[0-9][0-9]-sandbox-*.php

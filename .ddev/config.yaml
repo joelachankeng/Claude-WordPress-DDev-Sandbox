@@ -1,0 +1,52 @@
+# DDEV project configuration for the WordPress sandbox.
+#
+# There is deliberately NO `name:` field. DDEV falls back to the containing
+# directory's name, so copying this scaffolding into another WordPress project
+# gives that project its own containers, its own database, and its own
+# https://<directory-name>.ddev.site hostname with zero edits. That mirrors what
+# the old Docker Compose setup did with COMPOSE_PROJECT_NAME, except DDEV routes
+# every project through one shared router — so unlike the old 8080/8025 setup,
+# any number of sandboxes run at the same time without port conflicts.
+#
+# Per-project values that should NOT be committed (Pantheon site name, etc.)
+# belong in .ddev/config.local.yaml, which DDEV git-ignores for you.
+
+type: wordpress
+
+# The repository root is the docroot: wp-config.php, wp-content/ and WordPress
+# core all sit at the top level, matching Pantheon's layout.
+docroot: .
+
+php_version: "8.2"
+
+# nginx-fpm matches Pantheon, which also runs nginx. Note the consequence: the
+# repository's .htaccess is inert here, exactly as it is on Pantheon. Custom
+# rewrite or header rules go in .ddev/nginx_full/ instead.
+webserver_type: nginx-fpm
+
+database:
+    type: mariadb
+    version: "11.8"
+
+# Node is used by .sass/sass-runner.js inside the web container. The SASS
+# toolchain itself (sass/postcss/autoprefixer) is pinned in
+# .ddev/web-build/Dockerfile.
+nodejs_version: "24"
+corepack_enable: false
+
+composer_version: "2"
+
+# Step debugging is off by default; turn it on for a session with
+# `ddev xdebug on`.
+xdebug_enabled: false
+
+use_dns_when_possible: true
+
+additional_hostnames: []
+additional_fqdns: []
+
+# PANTHEON_ENVIRONMENT is deliberately NOT set here. Sandbox-only code gates on
+# DDEV's own IS_DDEV_PROJECT instead, which is always present in the web
+# container and readable through both getenv() and $_ENV (DDEV ships PHP with
+# variables_order=EGPCS).
+web_environment: []

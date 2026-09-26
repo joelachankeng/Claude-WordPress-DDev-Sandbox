@@ -1,37 +1,42 @@
 #!/usr/bin/env bash
-# Interactive control panel for the WordPress sandbox.
-# - Start / stop docker services
-# - Generate wp-config.local.php
-# - Import a SQL dump (sql / sql.gz / gz / zip) from project root
-# - Search-replace site URLs via wp-cli (single site, or network/multisite)
-# - Create or refresh a sandbox admin user (wp-cli, with direct-SQL fallback)
-# - Compile / watch SASS
-# - Update the Claude CLI baked into the sandbox image
+# Interactive control panel for the DDEV WordPress sandbox.
+#
+#   - Start / stop this project's DDEV site
+#   - Generate the DDEV WordPress config and wire wp-config.php to it
+#   - Import a SQL dump from the project root
+#   - Import the database from Pantheon (reusing a backup under a day old)
+#   - Search-replace site URLs (single site, or network/multisite)
+#   - Create or refresh a sandbox admin user
+#   - Compile / watch SASS
+#
+# Runs on the host and drives everything through `ddev`. Nothing here needs a
+# Compose project name, a port-conflict check, or a UID remap the way the old
+# Docker version did: DDEV routes every project through one shared router, so
+# any number of sandboxes run side by side, and the web container already runs
+# as the host user.
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-COMPOSE="$SCRIPT_DIR/compose.sh"
 
-# Per-project compose slug — must match the one compose.sh and the start scripts
-# derive, since it names the containers, volumes, and the claude image tag.
-PROJECT_SLUG="$(printf '%s' "${PROJECT_ROOT##*/}" | tr '[:upper:]' '[:lower:]' | tr -c '[:alnum:]_-' '-')-claude"
-CLAUDE_IMAGE="claude-dangerous:$PROJECT_SLUG"
+# Every ddev command is project-scoped by working directory.
+cd "$PROJECT_ROOT" || exit 1
 
-if [[ ! -x "$COMPOSE" ]]; then
-  echo "[ERROR] $COMPOSE not found or not executable." >&2
+if ! command -v ddev >/dev/null 2>&1; then
+  echo "[ERROR] ddev is not installed or not on PATH." >&2
+  echo "        See https://docs.ddev.com/en/stable/users/install/ddev-installation/" >&2
   exit 1
 fi
 
-# Defaults that match .local/docker-compose.yml.
-DB_HOST="db"
-DB_NAME="db"
-DB_USER="db"
-DB_PASSWORD="db"
-DB_ROOT_PASSWORD="root"
-DEFAULT_SITE_URL="http://localhost:8080"
-WP_CONFIG_LOCAL="$PROJECT_ROOT/wp-config.local.php"
-WP_CONFIG_TEMPLATE="$SCRIPT_DIR/wp-config.local.php"
+SASS_SCRIPT="$PROJECT_ROOT/.sass/sass.sh"
+DDEV_CONFIG="$PROJECT_ROOT/.ddev/config.yaml"
+DDEV_LOCAL_CONFIG="$PROJECT_ROOT/.ddev/config.local.yaml"
+WP_CONFIG="$PROJECT_ROOT/wp-config.php"
+WP_CONFIG_DDEV="$PROJECT_ROOT/wp-config-ddev.php"
+PANTHEON_DUMP_REL=".ddev/.downloads/pantheon-db.sql.gz"
+
+# How old Pantheon's newest database backup may be before we make a new one.
+PANTHEON_BACKUP_MAX_AGE_SECONDS=86400   # 24 hours
 
 # -------------------- helpers --------------------
 confirm() {
@@ -49,133 +54,244 @@ confirm() {
 
 pause() { read -rp "Press Enter to return to the menu..." _; }
 
-wp_cli() {
-  # --skip-plugins / --skip-themes: site-control only does core DB / user /
-  # option / search-replace work, none of which needs plugins or themes loaded.
-  # Skipping them avoids the full plugin bootstrap — heavy plugins (event-tickets,
-  # gravityforms, etc.) can exhaust PHP memory and make wp exit 255 — and is also
-  # the recommended way to run search-replace.
-  "$COMPOSE" --profile cli run --rm -T wp-cli wp --skip-plugins --skip-themes "$@"
-}
+ddev_configured() { [[ -f "$DDEV_CONFIG" ]]; }
 
-db_exec_sql() {
-  # $1 = one or more SQL statements.
-  # Stdin redirected from /dev/null because `docker compose exec` forwards the
-  # caller's stdin into the container even with -T. mariadb -e doesn't read
-  # stdin, but it still drains the parent shell's stdin — which silently eats
-  # menu input when site-control.sh is driven from a pipe.
-  "$COMPOSE" exec -T db mariadb -u root -p"$DB_ROOT_PASSWORD" "$DB_NAME" -e "$1" </dev/null
-}
+# True only when this project's containers are up. `ddev exec` fails fast on a
+# stopped project and never starts one, which makes it a cheap liveness probe.
+ddev_running() { ddev exec true >/dev/null 2>&1; }
 
-db_pipe() {
-  # stdin → mariadb client (for importing dumps or multi-statement scripts)
-  "$COMPOSE" exec -T db mariadb -u root -p"$DB_ROOT_PASSWORD" "$DB_NAME"
-}
-
-db_pipe_root() {
-  # like db_pipe but without a default database selected (for CREATE DATABASE)
-  "$COMPOSE" exec -T db mariadb -u root -p"$DB_ROOT_PASSWORD"
-}
-
-test_wp_connection() {
-  # Run wp db check; capture stdout+stderr so we can show *why* on failure.
-  local out rc
-  out=$(wp_cli db check 2>&1)
-  rc=$?
-  if (( rc != 0 )); then
-    LAST_WP_ERROR="$out"
-  else
-    LAST_WP_ERROR=""
+# .ddev/config.yaml deliberately has no `name:`, so DDEV derives the project
+# name from the directory. Read a name if one was added, else do the same.
+project_name() {
+  local n=""
+  if [[ -f "$DDEV_CONFIG" ]]; then
+    n="$(sed -n 's/^name:[[:space:]]*//p' "$DDEV_CONFIG" | head -1 | tr -d "\"'" | tr -d '[:space:]')"
   fi
-  return $rc
+  [[ -z "$n" ]] && n="${PROJECT_ROOT##*/}"
+  printf '%s' "$n"
 }
 
-# -------------------- actions --------------------
-# Detects whether host TCP port $1 is already bound. Prints a useful diagnostic
-# naming the offending docker container if it can find one, falling back to a
-# generic "non-docker process" message. Returns 0 when a conflict is found.
-check_port_conflict() {
-  local port="$1"
+# Authoritative when the site is up (straight from the container); otherwise the
+# name DDEV would derive, which is the project name lowercased.
+primary_url() {
+  local url=""
+  if ddev_running; then
+    url="$(ddev exec printenv DDEV_PRIMARY_URL 2>/dev/null | tr -d '\r\n')"
+  fi
+  if [[ -z "$url" ]]; then
+    url="https://$(project_name | tr '[:upper:]' '[:lower:]').ddev.site"
+  fi
+  printf '%s' "$url"
+}
 
-  local docker_offenders
-  docker_offenders=$(docker ps --format '{{.Names}}	{{.Ports}}' 2>/dev/null \
-    | awk -F'\t' -v p=":$port->" '$2 ~ p')
+# --skip-plugins / --skip-themes: this script only does core DB / user / option /
+# search-replace work, none of which needs plugins or themes loaded. Skipping
+# them avoids the full plugin bootstrap (heavy plugins such as event-tickets or
+# gravityforms can exhaust memory and make wp exit non-zero) and is also the
+# recommended way to run search-replace.
+wp_cli() { ddev wp --skip-plugins --skip-themes "$@"; }
 
-  if [[ -n "$docker_offenders" ]]; then
-    echo
-    echo "Cannot start: host port $port is already bound by another docker container:"
-    echo "$docker_offenders" | awk -F'\t' '{ printf "    %-50s  %s\n", $1, $2 }'
-    echo "Stop that container (e.g., 'docker stop <name>') and try again."
+# Raw SQL as root against this project's database. stdin from /dev/null so the
+# client can't drain the menu's own stdin when the script is driven from a pipe.
+db_query() { ddev mysql -N -B -e "$1" </dev/null; }
+
+require_running() {
+  if ddev_running; then
     return 0
   fi
-
-  # Fall back to a generic TCP probe via bash's /dev/tcp pseudo-device. Catches
-  # non-docker processes (a host dev server, etc.) that bash's docker ps misses.
-  if (echo > "/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
-    echo
-    echo "Cannot start: host port $port is in use by a non-docker process."
-    echo "Find it with 'ss -ltnp \"sport = :$port\"' or 'lsof -iTCP:$port -sTCP:LISTEN', stop it, and try again."
-    return 0
+  echo
+  echo "The DDEV site isn't running."
+  if confirm "Start it now?" Y; then
+    power_on
+    ddev_running && return 0
   fi
-
+  echo "Aborting — this action needs the site running."
   return 1
 }
 
+test_wp_connection() {
+  local out rc
+  out=$(wp_cli db check 2>&1)
+  rc=$?
+  if (( rc != 0 )); then LAST_WP_ERROR="$out"; else LAST_WP_ERROR=""; fi
+  return $rc
+}
+
+# -------------------- 1 / 2: power --------------------
+ensure_configured() {
+  if ddev_configured; then
+    return 0
+  fi
+  echo
+  echo "No .ddev/config.yaml found in $PROJECT_ROOT."
+  echo "This project hasn't been configured for DDEV yet."
+  if ! confirm "Create one now with the sandbox's standard settings?" Y; then
+    echo "Cancelled."
+    return 1
+  fi
+  # No --project-name on purpose: DDEV then derives it from the directory, so a
+  # copy of this scaffolding in another site names itself.
+  ddev config \
+    --project-type=wordpress \
+    --docroot=. \
+    --webserver-type=nginx-fpm \
+    --php-version=8.2 \
+    --database=mariadb:11.8 \
+    --nodejs-version=24 || return 1
+  echo "Wrote $DDEV_CONFIG"
+}
+
 power_on() {
-  # If wordpress is already up, nothing to start — and "port in use" would be us.
-  local wp_already
-  wp_already=$("$COMPOSE" ps --services --filter status=running 2>/dev/null | grep -cx wordpress || true)
-  if (( wp_already == 0 )); then
-    if check_port_conflict 8080; then
-      return 1
-    fi
-  fi
-
-  # Same check for mailpit's UI port. wordpress depends_on mailpit, so starting
-  # wordpress starts the mail catcher too — and a bound 8025 fails the whole
-  # power-on, not just mailpit.
-  local mailpit_already mailpit_port
-  mailpit_port="${MAILPIT_PORT:-8025}"
-  mailpit_already=$("$COMPOSE" ps --services --filter status=running 2>/dev/null | grep -cx mailpit || true)
-  if (( mailpit_already == 0 )); then
-    if check_port_conflict "$mailpit_port"; then
-      echo "(Mailpit's UI port. Re-run with MAILPIT_PORT=<free port> to move it.)"
-      return 1
-    fi
-  fi
-
-  echo "Powering on: db + wordpress + mailpit..."
-  "$COMPOSE" up -d db wordpress
+  ensure_configured || return 1
+  echo "Starting DDEV project '$(project_name)'..."
+  ddev start -y
 }
 
 power_off() {
-  echo "Powering off all services..."
-  "$COMPOSE" down
+  if ! ddev_configured; then
+    echo "Nothing to stop — this project isn't configured for DDEV."
+    return 0
+  fi
+  echo "Stopping DDEV project '$(project_name)'..."
+  # `ddev stop` is per-project and keeps the database volume. `ddev poweroff`
+  # would stop every project on the machine, including other sandboxes.
+  ddev stop
 }
 
-generate_wp_config_local() {
-  if [[ ! -f "$WP_CONFIG_TEMPLATE" ]]; then
-    echo "[ERROR] Template not found: $WP_CONFIG_TEMPLATE"
+# -------------------- 3: wp-config --------------------
+# The snippet added to a user-managed wp-config.php. Mirrors what DDEV writes
+# into its own generated wp-config.php, including the IS_DDEV_PROJECT guard so
+# the file stays harmless on a real host.
+wp_config_snippet() {
+  cat <<'SNIPPET'
+
+// Include for ddev-managed settings in wp-config-ddev.php.
+// Added by .local/site-control.sh (option 3). Safe outside DDEV: the guard
+// means a production host skips it entirely.
+$ddev_settings = dirname(__FILE__) . '/wp-config-ddev.php';
+if (getenv('IS_DDEV_PROJECT') === 'true' && is_readable($ddev_settings)) {
+    require_once($ddev_settings);
+}
+SNIPPET
+}
+
+generate_wp_config() {
+  ensure_configured || return 1
+
+  # DDEV writes wp-config-ddev.php itself as part of starting a `wordpress`
+  # project, so "generate" means: clear the managed copy and let DDEV rewrite it.
+  if [[ -f "$WP_CONFIG_DDEV" ]]; then
+    if grep -q '#ddev-generated' "$WP_CONFIG_DDEV" 2>/dev/null; then
+      echo "Removing the existing ddev-managed wp-config-ddev.php so DDEV rewrites it..."
+      rm -f "$WP_CONFIG_DDEV"
+    else
+      echo "Note: wp-config-ddev.php has no '#ddev-generated' marker — it looks hand-edited."
+      if ! confirm "Overwrite it?" N; then
+        echo "Keeping your file; only the wp-config.php wiring will be checked."
+      else
+        rm -f "$WP_CONFIG_DDEV"
+      fi
+    fi
+  fi
+
+  if [[ ! -f "$WP_CONFIG_DDEV" ]]; then
+    if ddev_running; then
+      echo "Restarting DDEV so it regenerates wp-config-ddev.php..."
+      ddev restart -y >/dev/null || { echo "[ERROR] ddev restart failed."; return 1; }
+    else
+      echo "Starting DDEV so it generates wp-config-ddev.php..."
+      ddev start -y >/dev/null || { echo "[ERROR] ddev start failed."; return 1; }
+    fi
+  fi
+
+  if [[ ! -f "$WP_CONFIG_DDEV" ]]; then
+    echo "[ERROR] DDEV did not create wp-config-ddev.php."
+    echo "        That normally means it doesn't see this as a WordPress project."
+    echo "        Check 'type: wordpress' in $DDEV_CONFIG."
+    return 1
+  fi
+  echo "wp-config-ddev.php is in place (DB credentials, WP_HOME and WP_SITEURL)."
+
+  # --- now make sure wp-config.php actually loads it ---
+  if [[ ! -f "$WP_CONFIG" ]]; then
+    echo
+    echo "No wp-config.php exists yet."
+    echo "DDEV creates a fully managed one the next time it starts, once WordPress"
+    echo "core is present. Nothing to wire up by hand."
+    return 0
+  fi
+
+  if grep -q '#ddev-generated' "$WP_CONFIG" 2>/dev/null; then
+    echo "wp-config.php is DDEV-managed and already loads it. Nothing to do."
+    return 0
+  fi
+
+  if grep -q 'wp-config-ddev\.php' "$WP_CONFIG" 2>/dev/null; then
+    echo "wp-config.php is yours and already includes wp-config-ddev.php. Nothing to do."
+    return 0
+  fi
+
+  # A user-managed wp-config.php (a Pantheon one, typically) that doesn't know
+  # about DDEV. DDEV refuses to edit these — it only prints a suggestion — so do
+  # it here, once, idempotently.
+  echo
+  echo "wp-config.php exists, is not DDEV-managed, and does not include"
+  echo "wp-config-ddev.php — so DDEV's database credentials never load."
+  echo
+  echo "The include has to run BEFORE wp-settings.php, so it will be inserted"
+  echo "immediately above the 'require wp-settings.php' line (or appended if"
+  echo "there isn't one)."
+  if ! confirm "Insert the include into wp-config.php?" Y; then
+    echo "Cancelled. Add this yourself, above the wp-settings.php require:"
+    wp_config_snippet
+    return 0
+  fi
+
+  local backup
+  backup="$WP_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$WP_CONFIG" "$backup" || { echo "[ERROR] Could not back up wp-config.php."; return 1; }
+  echo "Backed up to $(basename "$backup")"
+
+  local snippet_file tmp
+  snippet_file="$(mktemp)" || return 1
+  tmp="$(mktemp)" || { rm -f "$snippet_file"; return 1; }
+  wp_config_snippet > "$snippet_file"
+
+  awk -v snip="$snippet_file" '
+    !done && /require.*wp-settings\.php/ {
+      while ((getline line < snip) > 0) print line
+      close(snip)
+      done = 1
+    }
+    { print }
+    END {
+      if (!done) {
+        while ((getline line < snip) > 0) print line
+        close(snip)
+      }
+    }
+  ' "$WP_CONFIG" > "$tmp" || { echo "[ERROR] Failed to rewrite wp-config.php."; rm -f "$snippet_file" "$tmp"; return 1; }
+
+  if ! grep -q 'wp-config-ddev\.php' "$tmp"; then
+    echo "[ERROR] The rewrite did not contain the include — leaving wp-config.php untouched."
+    rm -f "$snippet_file" "$tmp"
     return 1
   fi
 
-  if [[ -f "$WP_CONFIG_LOCAL" ]]; then
-    # Heads-up if a user-edited file (no managed marker) is about to be clobbered.
-    if ! grep -q '#\.local-generated' "$WP_CONFIG_LOCAL"; then
-      echo "Note: existing wp-config.local.php has no '#.local-generated' marker — looks hand-edited."
-    fi
-    if ! confirm "wp-config.local.php exists. Overwrite?" N; then
-      echo "Cancelled."
-      return
-    fi
-  fi
-
-  cp "$WP_CONFIG_TEMPLATE" "$WP_CONFIG_LOCAL"
-
-  echo "Wrote $WP_CONFIG_LOCAL (copied from $WP_CONFIG_TEMPLATE)"
+  # Preserve the original file's permissions rather than mktemp's 0600.
+  cat "$tmp" > "$WP_CONFIG"
+  rm -f "$snippet_file" "$tmp"
+  echo "Inserted the include into wp-config.php."
+  echo
+  echo "If wp-config.php also hardcodes DB_NAME / DB_USER / DB_PASSWORD / DB_HOST,"
+  echo "comment those out — whichever is defined first wins, and DDEV's copy uses"
+  echo "defined() guards so it will not override them."
 }
 
+# -------------------- 4: import a SQL dump --------------------
 import_database() {
+  require_running || return 1
+
   local files=()
   while IFS= read -r -d '' f; do
     files+=("$f")
@@ -192,7 +308,7 @@ import_database() {
   echo "Available dumps in $PROJECT_ROOT:"
   local i=1
   for f in "${files[@]}"; do
-    printf "  %d) %s\n" "$i" "$(basename "$f")"
+    printf "  %d) %-45s %s\n" "$i" "$(basename "$f")" "$(du -h "$f" | cut -f1)"
     ((i++))
   done
   echo
@@ -207,306 +323,402 @@ import_database() {
   local selected="${files[$((choice-1))]}"
   echo "Selected: $(basename "$selected")"
 
-  if ! confirm "Overwrite database '$DB_NAME' with this dump?" N; then
+  if ! confirm "Replace the '$(project_name)' database with this dump?" N; then
     echo "Cancelled."
     return
   fi
 
-  echo "Dropping and recreating database '$DB_NAME'..."
-  db_pipe_root <<SQL
-DROP DATABASE IF EXISTS \`$DB_NAME\`;
-CREATE DATABASE \`$DB_NAME\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
-GRANT ALL PRIVILEGES ON \`$DB_NAME\`.* TO '$DB_USER'@'%';
-FLUSH PRIVILEGES;
-SQL
-
-  echo "Importing $(basename "$selected")..."
-  case "$selected" in
-    *.sql.gz|*.gz) gunzip -c "$selected" | db_pipe ;;
-    *.zip)         unzip -p "$selected" | db_pipe ;;
-    *.sql)         db_pipe < "$selected" ;;
-    *)             echo "Unsupported file type."; return ;;
-  esac
-  echo "Import complete."
+  # ddev import-db drops the existing tables first and understands .sql, .sql.gz,
+  # .zip and .tar.gz, so the old gunzip/unzip branches are gone.
+  ddev import-db --file="$selected"
 }
 
+# -------------------- 5: import the database from Pantheon --------------------
+pantheon_site_from_config() {
+  [[ -f "$DDEV_LOCAL_CONFIG" ]] || return 0
+  sed -n 's/.*DDEV_PANTHEON_SITE=\([^"'"'"' ]*\).*/\1/p' "$DDEV_LOCAL_CONFIG" | head -1
+}
+
+save_pantheon_site() {
+  local site="$1"
+  # .ddev/config.local.yaml is git-ignored by DDEV, which is where a per-project
+  # value like this belongs — config.yaml is committed and shared by every clone.
+  if [[ -f "$DDEV_LOCAL_CONFIG" ]] && grep -q 'DDEV_PANTHEON_SITE=' "$DDEV_LOCAL_CONFIG"; then
+    sed -i "s|DDEV_PANTHEON_SITE=[^\"' ]*|DDEV_PANTHEON_SITE=${site}|" "$DDEV_LOCAL_CONFIG"
+  elif [[ -f "$DDEV_LOCAL_CONFIG" ]] && grep -q '^web_environment:' "$DDEV_LOCAL_CONFIG"; then
+    sed -i "/^web_environment:/a\\    - DDEV_PANTHEON_SITE=${site}" "$DDEV_LOCAL_CONFIG"
+  else
+    cat >> "$DDEV_LOCAL_CONFIG" <<YAML
+# Per-project overrides. DDEV git-ignores this file.
+web_environment:
+    - DDEV_PANTHEON_SITE=${site}
+YAML
+  fi
+  echo "Saved DDEV_PANTHEON_SITE=${site} to .ddev/config.local.yaml"
+  echo "(A restart is needed before the container sees it: ddev restart)"
+}
+
+import_database_pantheon() {
+  require_running || return 1
+
+  # The machine token lives in ~/.ddev/global_config.yaml web_environment and is
+  # injected into the web container; we never read or print it here.
+  if ! ddev exec 'test -n "${TERMINUS_MACHINE_TOKEN:-}"' >/dev/null 2>&1; then
+    echo
+    echo "TERMINUS_MACHINE_TOKEN isn't set in the web container."
+    echo "Add it once, globally:"
+    echo "    ddev config global --web-environment-add=\"TERMINUS_MACHINE_TOKEN=<token>\""
+    echo "    ddev restart"
+    echo "Generate a token at https://dashboard.pantheon.io (Account -> Machine Tokens)."
+    return 1
+  fi
+
+  local site
+  site="$(pantheon_site_from_config)"
+  if [[ -n "$site" ]]; then
+    echo "Pantheon site (from .ddev/config.local.yaml): $site"
+    local replacement
+    read -rp "Press Enter to use it, or type a different site name: " replacement
+    [[ -n "$replacement" ]] && site="$replacement"
+  else
+    read -rp "Pantheon site name (blank to cancel): " site
+    [[ -z "$site" ]] && { echo "Cancelled."; return; }
+  fi
+
+  echo
+  echo "Which environment should the database come from?"
+  echo "  1) live   (production data)"
+  echo "  2) test"
+  echo "  3) dev"
+  echo "  4) other  (a multidev branch name)"
+  local env_choice env_name
+  read -rp "Choose [1-4, default 1]: " env_choice
+  case "${env_choice:-1}" in
+    1|"") env_name="live" ;;
+    2)    env_name="test" ;;
+    3)    env_name="dev" ;;
+    4)    read -rp "Multidev environment name: " env_name
+          [[ -z "$env_name" ]] && { echo "Cancelled."; return; } ;;
+    *)    echo "Invalid choice."; return ;;
+  esac
+
+  echo
+  cat <<EOF
+Plan
+----
+  Source      : ${site}.${env_name}
+  Backup rule : reuse Pantheon's newest database backup if it is less than
+                24 hours old; otherwise create a new one first.
+  Target      : the '$(project_name)' DDEV database (its contents are replaced)
+  Files       : not touched — code and uploads come from git.
+  Pushing     : disabled in .ddev/providers/pantheon.yaml.
+EOF
+  echo
+  if ! confirm "Proceed?" N; then
+    echo "Cancelled."
+    return
+  fi
+
+  mkdir -p "$PROJECT_ROOT/.ddev/.downloads" || return 1
+
+  # Everything terminus-related runs inside the web container, where terminus and
+  # the machine token both live.
+  if ! ddev exec bash -c '
+    set -euo pipefail
+    site="$1"; env_name="$2"; max_age="$3"; dest="$4"
+    target="${site}.${env_name}"
+
+    echo "Authenticating with Pantheon..."
+    terminus auth:login --machine-token="${TERMINUS_MACHINE_TOKEN}" >/dev/null \
+      || { echo "terminus login failed — check TERMINUS_MACHINE_TOKEN." >&2; exit 1; }
+
+    echo "Waking ${target}..."
+    terminus env:wake -- "${target}" >/dev/null 2>&1 || true
+
+    echo "Looking for an existing database backup..."
+    latest="$(terminus backup:list "${target}" --element=database --format=json 2>/dev/null \
+              | jq -r "[.[] | .date] | map(select(. != null)) | max // empty")"
+
+    latest_epoch=""
+    if [ -n "${latest}" ]; then
+      if printf "%s" "${latest}" | grep -qE "^[0-9]+$"; then
+        latest_epoch="${latest}"
+      else
+        # Some terminus versions format the date instead of emitting an epoch.
+        latest_epoch="$(date -d "${latest}" +%s 2>/dev/null || true)"
+      fi
+    fi
+
+    need_new=1
+    if [ -n "${latest_epoch}" ]; then
+      age=$(( $(date +%s) - latest_epoch ))
+      if [ "${age}" -le "${max_age}" ]; then
+        printf "Newest backup is %d hours old — reusing it.\n" "$(( age / 3600 ))"
+        need_new=0
+      else
+        printf "Newest backup is %d hours old — older than a day.\n" "$(( age / 3600 ))"
+      fi
+    else
+      echo "No usable database backup found."
+    fi
+
+    if [ "${need_new}" -eq 1 ]; then
+      echo "Creating a fresh database backup on ${target} (this can take several minutes)..."
+      terminus backup:create "${target}" --element=database
+    fi
+
+    echo "Downloading the backup..."
+    rm -f "${dest}"
+    terminus backup:get "${target}" --element=database --to="${dest}"
+    ls -lh "${dest}"
+  ' -- "$site" "$env_name" "$PANTHEON_BACKUP_MAX_AGE_SECONDS" "/var/www/html/$PANTHEON_DUMP_REL"; then
+    echo "[ERROR] Pantheon download failed — the local database is untouched."
+    return 1
+  fi
+
+  echo
+  echo "Importing into the '$(project_name)' database..."
+  if ! ddev import-db --file="$PROJECT_ROOT/$PANTHEON_DUMP_REL"; then
+    echo "[ERROR] Import failed. The dump is still at $PANTHEON_DUMP_REL."
+    return 1
+  fi
+  echo "Import complete."
+
+  # Offer to save the site name only once it has actually worked.
+  if [[ "$(pantheon_site_from_config)" != "$site" ]]; then
+    echo
+    confirm "Remember '$site' as this project's Pantheon site?" Y && save_pantheon_site "$site"
+  fi
+
+  echo
+  echo "Note: wp-config-ddev.php defines WP_HOME and WP_SITEURL from DDEV, which"
+  echo "override whatever URL is in the imported database — so the site is"
+  echo "browsable now. Search-replace only matters for URLs hardcoded in content,"
+  echo "and for a multisite network (wp_blogs / wp_site store bare domains)."
+  echo
+  echo "  1) Run search-replace now (single site)"
+  echo "  2) Run search-replace now (multisite/network)"
+  echo "  3) Skip"
+  local sr
+  read -rp "Choose [1-3, default 3]: " sr
+  case "${sr:-3}" in
+    1) search_replace_urls ;;
+    2) search_replace_multisite ;;
+    *) echo "Skipped." ;;
+  esac
+}
+
+# -------------------- 6: search-replace (single site) --------------------
 search_replace_urls() {
+  require_running || return 1
+
   while true; do
-    echo "Testing wp-cli database connection..."
+    echo "Testing the WP-CLI database connection..."
     if test_wp_connection; then
       echo "Connection OK."
       break
     fi
     echo
-    echo "wp-cli can't connect to the database."
+    echo "WP-CLI can't reach the database."
     if [[ -n "${LAST_WP_ERROR:-}" ]]; then
       echo "--- wp-cli output ---"
       echo "$LAST_WP_ERROR"
       echo "---------------------"
     fi
-    echo "Likely causes: services down, wp-config.php / wp-config.local.php misconfigured,"
-    echo "or the db container isn't ready yet."
-    if confirm "Fix it and retry connection?" Y; then
-      continue
-    else
-      echo "Aborting."
-      return
-    fi
+    echo "Likely causes: wp-config.php doesn't include wp-config-ddev.php (menu"
+    echo "option 3), or WordPress core isn't present yet."
+    if confirm "Fix it and retry?" Y; then continue; else echo "Aborting."; return; fi
   done
 
   local old_url
-  old_url=$(wp_cli option get siteurl 2>/dev/null | tr -d '\r' || true)
+  old_url=$(wp_cli option get siteurl 2>/dev/null | tr -d '\r')
   if [[ -z "$old_url" ]]; then
-    echo "Couldn't detect current site URL from the database."
+    echo "Couldn't read the current site URL from the database."
     read -rp "Enter the OLD URL to replace (blank to cancel): " old_url
     [[ -z "$old_url" ]] && { echo "Cancelled."; return; }
   else
-    echo "Detected current site URL: $old_url"
+    echo "Current site URL in the database: $old_url"
   fi
 
-  local new_url="$DEFAULT_SITE_URL"
+  local new_url input
+  new_url="$(primary_url)"
   read -rp "New site URL [default: $new_url]: " input
   new_url="${input:-$new_url}"
 
-  if [[ "$old_url" == "$new_url" ]]; then
+  # Strip scheme and any trailing slash so both http:// and https:// forms of the
+  # old host get replaced. A production dump is usually https while an older
+  # export may hold http links, and missing one leaves mixed-content URLs behind.
+  local old_host
+  old_host="$(printf '%s' "$old_url" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/+$##')"
+  local new_clean
+  new_clean="$(printf '%s' "$new_url" | sed -E 's#/+$##')"
+
+  if [[ "https://$old_host" == "$new_clean" ]]; then
     echo "Old and new URLs are the same — nothing to do."
     return
   fi
 
   echo
-  echo "Replacing across all tables:"
-  echo "  $old_url"
-  echo "→ $new_url"
-  if ! confirm "Proceed?" Y; then
-    echo "Cancelled."
-    return
-  fi
+  echo "Replacing across all tables (guid skipped):"
+  echo "  https://$old_host  ->  $new_clean"
+  echo "  http://$old_host   ->  $new_clean"
+  if ! confirm "Proceed?" Y; then echo "Cancelled."; return; fi
 
-  wp_cli search-replace "$old_url" "$new_url" --all-tables --skip-columns=guid
+  local rc=0
+  wp_cli search-replace "https://$old_host" "$new_clean" \
+    --all-tables --skip-columns=guid --report-changed-only || rc=$?
+  wp_cli search-replace "http://$old_host" "$new_clean" \
+    --all-tables --skip-columns=guid --report-changed-only || rc=$?
+
+  if (( rc == 0 )); then
+    wp_cli cache flush >/dev/null 2>&1 || true
+    echo "Done."
+  else
+    echo "[WARN] One or more passes exited non-zero (rc=$rc). Review the output above."
+  fi
+  return $rc
 }
 
+# -------------------- 7: search-replace (multisite) --------------------
 search_replace_multisite() {
-  # The plain action above is wrong for a WordPress *network*: it can't bootstrap
-  # wp-cli after a fresh import (the sandbox DOMAIN_CURRENT_SITE doesn't yet match
-  # any wp_blogs row) and it misses the protocol-less domain columns in wp_blogs /
-  # wp_site / wp_sitemeta. Delegate to the dedicated multisite script, which boots
-  # against the OLD host still in the DB and does the extra bare-domain pass.
+  # The single-site action above is wrong for a WordPress *network*: it can't
+  # bootstrap WP-CLI after a fresh import, and it misses the protocol-less domain
+  # columns in wp_blogs / wp_site / wp_sitemeta. Delegate to the dedicated script.
   local mss="$SCRIPT_DIR/search-replace-multisite.sh"
-  if [[ ! -x "$mss" ]]; then
-    echo "[ERROR] $mss not found or not executable."
+  if [[ ! -f "$mss" ]]; then
+    echo "[ERROR] $mss not found."
     return 1
   fi
-  "$mss"
+  require_running || return 1
+  bash "$mss"
 }
 
+# -------------------- 8: admin user --------------------
 create_admin_user() {
+  require_running || return 1
+
   local email="admin@admin.com"
   local password="admin"
   local username="admin"
 
   if test_wp_connection; then
-    echo "wp-cli connection OK — using wp user commands."
+    echo "WP-CLI connection OK — using wp user commands."
     local existing_id
-    existing_id=$(wp_cli user get "$email" --field=ID 2>/dev/null | tr -d '\r[:space:]' || true)
+    existing_id=$(wp_cli user get "$email" --field=ID 2>/dev/null | tr -d '\r[:space:]')
     if [[ -n "$existing_id" && "$existing_id" =~ ^[0-9]+$ ]]; then
-      echo "User $email exists (ID $existing_id). Updating password and ensuring administrator role."
+      echo "User $email exists (ID $existing_id). Resetting the password and ensuring the administrator role."
       wp_cli user update "$existing_id" --user_pass="$password" --role=administrator
     else
-      echo "Creating user $username / $email / password '$password' (administrator)."
+      echo "Creating $username / $email / password '$password' (administrator)."
       wp_cli user create "$username" "$email" --user_pass="$password" --role=administrator --display_name=Admin
     fi
     return
   fi
 
-  echo "wp-cli unavailable — falling back to direct SQL."
+  echo "WP-CLI is unavailable — falling back to direct SQL."
+  if [[ -n "${LAST_WP_ERROR:-}" ]]; then
+    echo "--- wp-cli output ---"
+    echo "$LAST_WP_ERROR"
+    echo "---------------------"
+  fi
 
-  # Best-effort table-prefix detection from wp-config files.
-  local prefix="wp_"
-  for f in "$PROJECT_ROOT/wp-config.local.php" "$PROJECT_ROOT/wp-config.php"; do
-    if [[ -f "$f" ]]; then
-      local found
-      found=$(grep -oP "table_prefix\s*=\s*['\"]\K[^'\"]+" "$f" 2>/dev/null | head -1 || true)
-      if [[ -n "$found" ]]; then
-        prefix="$found"
-        break
-      fi
-    fi
+  # Best-effort table-prefix detection. wp-config-ddev.php honours DB_PREFIX and
+  # otherwise falls back to wp_, so check the project's own config files first.
+  local prefix="wp_" f found
+  for f in "$WP_CONFIG" "$WP_CONFIG_DDEV"; do
+    [[ -f "$f" ]] || continue
+    found=$(grep -oP "table_prefix\s*=\s*['\"]\K[^'\"]+" "$f" 2>/dev/null | head -1)
+    if [[ -n "$found" ]]; then prefix="$found"; break; fi
   done
   echo "Using table prefix: $prefix"
 
   local users_table="${prefix}users"
   local usermeta_table="${prefix}usermeta"
 
-  # Look up existing user.
   local existing_id
-  existing_id=$(db_exec_sql "SELECT ID FROM \`$users_table\` WHERE user_email='$email' LIMIT 1;" 2>/dev/null \
-                | tail -n +2 | tr -d '[:space:]' || true)
+  existing_id=$(db_query "SELECT ID FROM \`$users_table\` WHERE user_email='$email' LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
 
   if [[ -n "$existing_id" && "$existing_id" =~ ^[0-9]+$ ]]; then
-    echo "User $email exists (ID $existing_id). Resetting password to '$password' (legacy MD5; WP rehashes on next login)."
-    db_exec_sql "UPDATE \`$users_table\` SET user_pass = MD5('$password') WHERE ID = $existing_id;"
+    echo "User $email exists (ID $existing_id). Resetting the password to '$password'"
+    echo "(legacy MD5 hash; WordPress rehashes it on the next login)."
+    db_query "UPDATE \`$users_table\` SET user_pass = MD5('$password') WHERE ID = $existing_id;"
   else
-    echo "Inserting new admin user via SQL."
-    db_pipe <<SQL
-INSERT INTO \`$users_table\` (user_login, user_pass, user_nicename, user_email, user_registered, display_name)
-VALUES ('$username', MD5('$password'), '$username', '$email', NOW(), 'Admin');
-SET @uid = LAST_INSERT_ID();
-INSERT INTO \`$usermeta_table\` (user_id, meta_key, meta_value)
-VALUES (@uid, '${prefix}capabilities', 'a:1:{s:13:"administrator";b:1;}');
-INSERT INTO \`$usermeta_table\` (user_id, meta_key, meta_value)
-VALUES (@uid, '${prefix}user_level', '10');
-SQL
-    echo "Admin user inserted."
+    echo "Inserting a new admin user via SQL."
+    db_query "
+      INSERT INTO \`$users_table\` (user_login, user_pass, user_nicename, user_email, user_registered, display_name)
+      VALUES ('$username', MD5('$password'), '$username', '$email', NOW(), 'Admin');
+      SET @uid = LAST_INSERT_ID();
+      INSERT INTO \`$usermeta_table\` (user_id, meta_key, meta_value)
+      VALUES (@uid, '${prefix}capabilities', 'a:1:{s:13:\"administrator\";b:1;}');
+      INSERT INTO \`$usermeta_table\` (user_id, meta_key, meta_value)
+      VALUES (@uid, '${prefix}user_level', '10');
+    " && echo "Admin user inserted."
   fi
 }
 
-# -------------------- sass --------------------
-SASS_SCRIPT="$PROJECT_ROOT/.sass/sass.sh"
-
-sandbox_is_up() {
-  # True when both db and wordpress show as running. Mirrors print_status logic.
-  local running
-  running=$("$COMPOSE" ps --services --filter status=running 2>/dev/null || true)
-  grep -qx db        <<<"$running" || return 1
-  grep -qx wordpress <<<"$running" || return 1
-  return 0
-}
-
+# -------------------- 9 / 10: sass --------------------
 run_sass() {
   local mode="$1"  # compile | watch
-
-  if [[ ! -x "$SASS_SCRIPT" ]]; then
-    echo "[ERROR] $SASS_SCRIPT not found or not executable."
+  if [[ ! -f "$SASS_SCRIPT" ]]; then
+    echo "[ERROR] $SASS_SCRIPT not found."
     return 1
   fi
-
-  if ! sandbox_is_up; then
-    echo
-    echo "The sandbox container isn't running."
-    echo "Power it on first with menu option 1, then come back."
-    return 0
-  fi
-
-  echo "Running SASS $mode inside the sandbox..."
-  "$SASS_SCRIPT" "$mode"
+  require_running || return 1
+  echo "Running SASS $mode in the web container..."
+  bash "$SASS_SCRIPT" "$mode"
 }
 
 compile_sass() { run_sass compile; }
 watch_sass()   { run_sass watch; }
 
-# -------------------- claude cli --------------------
-# The CLI is baked into the image (npm -g inside the container), not stored in a
-# volume, so "updating" it means rebuilding the image. The Dockerfile isolates
-# @anthropic-ai/claude-code in the final layer and takes the version as a build
-# arg, so pinning a resolved version number rebuilds that layer alone — the apt
-# and Chrome layers stay cached and the rebuild takes seconds, not minutes.
-claude_installed_version() {
-  # Read the version out of the built image without starting the whole stack.
-  local img="$CLAUDE_IMAGE"
-  docker image inspect "$img" >/dev/null 2>&1 || return 1
-  docker run --rm --entrypoint node "$img" \
-    -e 'console.log(require("/home/node/.npm-global/lib/node_modules/@anthropic-ai/claude-code/package.json").version)' \
-    2>/dev/null | tr -d '\r[:space:]'
-}
-
-claude_latest_version() {
-  # Ask the npm registry directly; jq is not guaranteed on the host.
-  curl -fsSL https://registry.npmjs.org/@anthropic-ai/claude-code/latest 2>/dev/null \
-    | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' \
-    | head -1 \
-    | sed 's/.*"\([^"]*\)"$/\1/'
-}
-
-update_claude_cli() {
-  local img="$CLAUDE_IMAGE" current latest target
-
-  if ! docker image inspect "$img" >/dev/null 2>&1; then
-    echo "Image $img doesn't exist yet — nothing to update."
-    echo "Build it first with ./.local/start-claude-dangerously.sh (or rebuild-claude.sh)."
-    return 1
-  fi
-
-  current="$(claude_installed_version || true)"
-  echo "Installed in $img: ${current:-unknown}"
-
-  echo "Checking the npm registry for the latest release..."
-  latest="$(claude_latest_version || true)"
-  if [[ -z "$latest" ]]; then
-    echo "Couldn't reach the npm registry to resolve the latest version."
-    read -rp "Enter a version to install manually (blank to cancel): " target
-    [[ -z "$target" ]] && { echo "Cancelled."; return; }
-  else
-    echo "Latest on npm:              $latest"
-    if [[ -n "$current" && "$current" == "$latest" ]]; then
-      echo
-      echo "Already up to date."
-      if ! confirm "Rebuild anyway?" N; then
-        echo "Nothing to do."
-        return
-      fi
-    fi
-    read -rp "Version to install [default: $latest]: " target
-    target="${target:-$latest}"
-  fi
-
-  echo
-  echo "Rebuilding $img with @anthropic-ai/claude-code@$target."
-  echo "Only the final image layer is rebuilt — apt and Chrome stay cached."
-  if ! confirm "Proceed?" Y; then
-    echo "Cancelled."
-    return
-  fi
-
-  if ! "$COMPOSE" build --build-arg "CLAUDE_CODE_VERSION=$target" claude; then
-    echo "[ERROR] Build failed — the previous image is untouched."
-    return 1
-  fi
-
-  echo
-  echo "Now installed: $(claude_installed_version || echo unknown)"
-  echo "Restart Claude (./.local/start-claude-dangerously.sh) to pick up the new version;"
-  echo "a session already running keeps the old one until it exits."
-}
-
 # -------------------- status --------------------
 print_status() {
-  local running db_status="stopped" wp_status="stopped"
-  running=$("$COMPOSE" ps --services --filter status=running 2>/dev/null || true)
-  grep -qx db         <<<"$running" && db_status="running"
-  grep -qx wordpress  <<<"$running" && wp_status="running"
+  local name url ddev_state="stopped" cfg="missing" core="absent" siteurl="-"
 
-  local cfg_status="missing"
-  [[ -f "$WP_CONFIG_LOCAL" ]] && cfg_status="present"
+  name="$(project_name)"
+  if ! ddev_configured; then
+    ddev_state="not configured"
+  elif ddev_running; then
+    ddev_state="running"
+  fi
+  url="$(primary_url)"
 
-  local siteurl="-"
-  if [[ "$db_status" == "running" ]]; then
-    siteurl=$(db_exec_sql "SELECT option_value FROM wp_options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null \
-              | tail -n 1 | tr -d '[:space:]' || true)
-    [[ -z "$siteurl" ]] && siteurl="(no wp_options row — db empty?)"
+  if [[ -f "$WP_CONFIG" ]]; then
+    if grep -q '#ddev-generated' "$WP_CONFIG" 2>/dev/null; then
+      cfg="present (DDEV-managed)"
+    elif grep -q 'wp-config-ddev\.php' "$WP_CONFIG" 2>/dev/null; then
+      cfg="present (yours, includes DDEV config)"
+    else
+      cfg="present - NOT wired to DDEV (run option 3)"
+    fi
+  fi
+
+  [[ -f "$PROJECT_ROOT/wp-settings.php" ]] && core="present"
+
+  if [[ "$ddev_state" == "running" ]]; then
+    siteurl=$(db_query "SELECT option_value FROM wp_options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null | tr -d '[:space:]')
+    [[ -z "$siteurl" ]] && siteurl="(no wp_options row — database empty?)"
   fi
 
   cat <<EOF
 ------------------------------------------
- Status   (project: $PROJECT_SLUG)
+ Status   (project: $name)
 ------------------------------------------
-  db:         $db_status
-  wordpress:  $wp_status
-  wp-config:  $cfg_status  ($WP_CONFIG_LOCAL)
-  siteurl:    $siteurl
+  ddev:        $ddev_state
+  url:         $url
+  mailpit:     ${url}:8026
+  wp core:     $core
+  wp-config:   $cfg
+  db siteurl:  $siteurl
 EOF
 }
 
 # -------------------- main menu --------------------
 run_action() {
-  # Wrap each action so a failure returns to the menu instead of killing the script.
   local fn="$1"
-  set +e
   ( "$fn" )
   local rc=$?
-  set -e 2>/dev/null || true
-  if (( rc != 0 )); then
-    echo "[action exited with status $rc]"
-  fi
+  (( rc != 0 )) && echo "[action exited with status $rc]"
 }
 
 main_menu() {
@@ -516,34 +728,34 @@ main_menu() {
 ==========================================
    Sandbox site control
 ==========================================
-  1) Power on  (start db + wordpress)
-  2) Power off (stop all services)
-  3) Generate wp-config.local.php
-  4) Import database from SQL file
-  5) Search-replace database URLs (single site)
-  6) Search-replace database URLs (multisite/network)
-  7) Create/refresh sandbox admin user
-  8) Compile SASS
-  9) Watch SASS (Ctrl+C to stop)
- 10) Update Claude CLI (rebuild image with the latest release)
+  1) Power on  (ddev start)
+  2) Power off (ddev stop)
+  3) Generate the DDEV WordPress config
+  4) Import database from a SQL file
+  5) Import database from Pantheon
+  6) Search-replace database URLs (single site)
+  7) Search-replace database URLs (multisite/network)
+  8) Create/refresh sandbox admin user
+  9) Compile SASS
+ 10) Watch SASS (Ctrl+C to stop)
   q) Quit
 
 EOF
     local choice
     read -rp "Choose: " choice
     case "$choice" in
-      1) run_action power_on ;;
-      2) run_action power_off ;;
-      3) run_action generate_wp_config_local ;;
-      4) run_action import_database ;;
-      5) run_action search_replace_urls ;;
-      6) run_action search_replace_multisite ;;
-      7) run_action create_admin_user ;;
-      8) run_action compile_sass ;;
-      9) run_action watch_sass ;;
-      10) run_action update_claude_cli ;;
+      1)  run_action power_on ;;
+      2)  run_action power_off ;;
+      3)  run_action generate_wp_config ;;
+      4)  run_action import_database ;;
+      5)  run_action import_database_pantheon ;;
+      6)  run_action search_replace_urls ;;
+      7)  run_action search_replace_multisite ;;
+      8)  run_action create_admin_user ;;
+      9)  run_action compile_sass ;;
+      10) run_action watch_sass ;;
       q|Q) echo "Goodbye."; exit 0 ;;
-      *) echo "Invalid choice." ;;
+      *)  echo "Invalid choice." ;;
     esac
     echo
     pause

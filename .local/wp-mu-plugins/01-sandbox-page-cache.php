@@ -5,7 +5,8 @@
  * .local manages this file and overwrites it on every container start.
  *
  * Source:       .local/wp-mu-plugins/01-sandbox-page-cache.php
- * Installed by: .local/wp-entrypoint.sh  ->  wp-content/mu-plugins/local-mu-plugins/
+ * Installed by: .ddev/web-entrypoint.d/10-sandbox-mu-plugins.sh
+ *                 -> wp-content/mu-plugins/local-mu-plugins/
  * Loaded by:    wp-content/mu-plugins/00-local-mu-plugins.php (generated stub)
  *
  * Drops the Pantheon page-cache TTL to zero in the sandbox.
@@ -25,11 +26,9 @@
  * @package .local
  */
 
-// Sandbox-only. Every sandbox service sets PANTHEON_ENVIRONMENT=local; a real
-// host does not, so a stray copy of this file can never slow production down.
-// getenv() is used rather than $_ENV because WP-CLI runs with an empty $_ENV
-// unless variables_order includes E (see .local/DOC/FIX/WP_CLI_DB_CONNECTION_FIX.md).
-if (getenv('PANTHEON_ENVIRONMENT') !== 'local') {
+// Sandbox-only. IS_DDEV_PROJECT is set in every DDEV web container and nowhere
+// else, so a stray copy of this file can never slow production down.
+if (getenv('IS_DDEV_PROJECT') !== 'true') {
     return;
 }
 
@@ -45,7 +44,7 @@ if (getenv('PANTHEON_ENVIRONMENT') !== 'local') {
  *
  * Pantheon clamps a sub-60-second TTL back up to 60 when PANTHEON_ENVIRONMENT
  * is 'live', so even a misplaced copy of this file cannot disable caching on a
- * production site.
+ * production site. The IS_DDEV_PROJECT gate above means it never gets there.
  */
 add_filter('pantheon_cache_default_max_age', static function () {
     return 0;

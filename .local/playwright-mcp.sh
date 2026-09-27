@@ -45,6 +45,21 @@ mkdir -p "$PROFILE_DIR" "$OUTPUT_DIR"
 # Housekeeping for the screenshot directory, as the old start scripts did.
 [[ -x "$SCRIPT_DIR/prune-playwright-mcp.sh" ]] && "$SCRIPT_DIR/prune-playwright-mcp.sh" >&2 2>/dev/null
 
+# Which browser binary to drive.
+#
+# @playwright/mcp defaults to the "chrome" CHANNEL — i.e. a real Google Chrome
+# installed system-wide at /opt/google/chrome/chrome — and fails outright with
+# "Chromium distribution 'chrome' is not found" when it is absent. Its --browser
+# flag only accepts chrome/firefox/webkit/msedge, so there is no "chromium"
+# value to select the browser `playwright install chromium` actually downloaded.
+#
+# Rather than require a system Chrome (which needs root to install), point the
+# server at Playwright's own bundled Chromium. The path is resolved through
+# Playwright's API instead of hardcoded, because it carries a build number
+# (chromium-1243/...) that changes on every Playwright upgrade.
+BROWSER_PATH="$(NODE_PATH="$(npm root -g 2>/dev/null)" node -e \
+  'console.log(require("playwright").chromium.executablePath())' 2>/dev/null)"
+
 ARGS=(
   --user-data-dir "$PROFILE_DIR"
   --output-dir "$OUTPUT_DIR"
@@ -56,6 +71,14 @@ ARGS=(
   # worth seeing while debugging a theme or plugin.
   --console-level warning
 )
+
+if [[ -n "$BROWSER_PATH" && -x "$BROWSER_PATH" ]]; then
+  ARGS+=(--executable-path "$BROWSER_PATH")
+  log "browser: $BROWSER_PATH"
+else
+  log "could not resolve Playwright's bundled Chromium; falling back to the"
+  log "default 'chrome' channel. If that fails, run: npx playwright install chromium"
+fi
 
 # A dotenv file of credentials the browser may use WITHOUT them passing through
 # the conversation. Create it yourself; it is git-ignored, and .claude/settings.json

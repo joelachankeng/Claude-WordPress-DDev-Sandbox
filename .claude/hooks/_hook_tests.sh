@@ -38,4 +38,10 @@ run "find -exec cat"                "find . -name .env -exec cat {} +"          
 run "playwright secrets"            "cat .local/.playwright-secrets"                       "BLOCK"
 run "playwright secrets via grep"   "grep -i pass .local/.playwright-secrets"              "BLOCK"
 run "playwright profile is fine"    "ls .local/.playwright-profile"                        "ALLOW"
+# Regression cases for the lookbehind. Reading an environment variable in Node is
+# extremely common and must not be mistaken for reading the dotfile.
+run "node reads an env var"         "node -e 'console.log(process.env.HOME)'"             "ALLOW"
+run "node env var, no property"     "node -e 'console.log(process.env)'"                  "ALLOW"
+run "dotfile via relative path"     "cat ./.env"                                          "BLOCK"
+run "dotfile in a subdirectory"     "cat config/.env.production"                          "BLOCK"
 echo "--- done ---"

@@ -788,6 +788,37 @@ sudo update-alternatives --set x-window-manager /usr/bin/xfwm4
 reclaim it. This does not affect the sandbox: `display.sh` runs openbox by name on
 the `:99` display and never consults the alternative.
 
+### The RDP session shows a blank screen
+
+Expected, if no browser is open. The `:99` display is a bare window manager with
+nothing on it between automation runs, so it renders as one flat colour — and an
+untouched openbox root is pure **black**, which is indistinguishable from a dead
+connection.
+
+`display.sh` now paints the root window dark blue (set `SANDBOX_ROOT_COLOR` to
+change it) precisely so "connected, nothing open" does not look like "broken".
+Check what is actually there:
+
+```bash
+.local/display.sh status     # says "windows: none open" when it is simply empty
+ss -tnp | grep 5900          # an ESTABLISHED line means your RDP client IS attached
+```
+
+If both look healthy the session is fine — open a browser and it will appear.
+
+### The browser will not start: "Chromium distribution 'chrome' is not found"
+
+`@playwright/mcp` defaults to the **chrome channel**, meaning a system-wide Google
+Chrome at `/opt/google/chrome/chrome`, and its `--browser` flag accepts only
+`chrome`, `firefox`, `webkit` and `msedge` — there is no value that selects the
+Chromium `playwright install chromium` downloads. `playwright-mcp.sh` therefore
+resolves Playwright's own bundled Chromium and passes it with `--executable-path`,
+rather than requiring a root install of Chrome. It resolves the path through
+Playwright's API because it contains a build number that changes on upgrade.
+
+If you hit this error, the MCP server is running an older copy of that script —
+restart your Claude session so it re-launches.
+
 ### The headed browser's window manager keeps dying
 
 If `display.sh status` shows openbox stopped and its log ends with:

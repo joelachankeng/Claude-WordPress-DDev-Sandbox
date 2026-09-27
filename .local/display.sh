@@ -150,6 +150,14 @@ start_up() {
     return 1
   fi
 
+  # Give the root window a colour. An empty openbox root is pure black, which is
+  # indistinguishable from "the RDP session is broken" when you connect and no
+  # browser happens to be open — and that is the normal state between automation
+  # runs. A distinct colour makes "connected, nothing open yet" obvious.
+  if command -v xsetroot >/dev/null 2>&1; then
+    DISPLAY="$DISPLAY_NAME" xsetroot -solid "${SANDBOX_ROOT_COLOR:-#1b3a5c}" 2>/dev/null || true
+  fi
+
   (( quiet )) || {
     echo
     echo "Display $DISPLAY_NAME is ready."
@@ -186,9 +194,16 @@ print_status() {
   printf '  geometry   %s\n' "$SCREEN_GEOMETRY"
   printf '  logs       %s\n' "$LOG_DIR"
   if xvfb_running; then
-    echo "  windows currently on the display:"
-    DISPLAY="$DISPLAY_NAME" wmctrl -l 2>/dev/null | sed 's/^/    /' \
-      || echo "    (install wmctrl to list them)"
+    local windows
+    windows="$(DISPLAY="$DISPLAY_NAME" wmctrl -l 2>/dev/null)"
+    if [[ -n "$windows" ]]; then
+      echo "  windows currently on the display:"
+      sed 's/^/    /' <<<"$windows"
+    else
+      echo "  windows:     none open"
+      echo "               (over RDP this looks like a plain coloured screen —"
+      echo "                that is the empty display, not a broken connection)"
+    fi
   fi
 }
 

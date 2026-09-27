@@ -23,8 +23,17 @@ if [ -z "$cmd" ]; then exit 0; fi
 # Playwright secrets file (credentials the browser may use but Claude may not
 # read - see .local/playwright-mcp.sh --secrets).
 # Filter out .env.example - the only .env variant safe to read.
+#
+# The (?<![A-Za-z0-9_]) lookbehind prevents a common and costly false positive:
+# code that reads environment variables. Without it, JavaScript such as
+#     node -e 'console.log(process.env.HOME)'
+# matches twice over - once as ".env.HOME" and once as bare ".env" followed by a
+# dot - so ANY command carrying Node code that touches process.env is refused.
+# That is noise rather than protection, and noise is what gets a hook switched
+# off. Requiring a non-identifier character before ".env" keeps "cat .env",
+# "cat ./.env" and "cp .env .env.bak" matching, while letting process.env through.
 hits=$(printf '%s' "$cmd" \
-    | grep -oP '\.env\.[A-Za-z0-9_-]+|\.env(?=\W|$)|\.playwright-secrets' 2>/dev/null \
+    | grep -oP '(?<![A-Za-z0-9_])\.env\.[A-Za-z0-9_-]+|(?<![A-Za-z0-9_])\.env(?=\W|$)|\.playwright-secrets' 2>/dev/null \
     | grep -vx '\.env\.example' 2>/dev/null)
 
 if [ -n "$hits" ]; then

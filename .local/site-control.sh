@@ -58,7 +58,13 @@ ddev_configured() { [[ -f "$DDEV_CONFIG" ]]; }
 
 # True only when this project's containers are up. `ddev exec` fails fast on a
 # stopped project and never starts one, which makes it a cheap liveness probe.
-ddev_running() { ddev exec true >/dev/null 2>&1; }
+#
+# stdin from /dev/null, here and in every other non-interactive ddev call below:
+# `ddev exec` forwards the caller's stdin into the container, so without this it
+# silently eats the menu's own keystrokes — the status panel runs three of these
+# before the prompt is even drawn. (The Docker version of this script had the
+# same guard on `docker compose exec` for the same reason.)
+ddev_running() { ddev exec true >/dev/null 2>&1 </dev/null; }
 
 # .ddev/config.yaml deliberately has no `name:`, so DDEV derives the project
 # name from the directory. Read a name if one was added, else do the same.
@@ -76,7 +82,7 @@ project_name() {
 primary_url() {
   local url=""
   if ddev_running; then
-    url="$(ddev exec printenv DDEV_PRIMARY_URL 2>/dev/null | tr -d '\r\n')"
+    url="$(ddev exec printenv DDEV_PRIMARY_URL 2>/dev/null </dev/null | tr -d '\r\n')"
   fi
   if [[ -z "$url" ]]; then
     url="https://$(project_name | tr '[:upper:]' '[:lower:]').ddev.site"
@@ -89,7 +95,7 @@ primary_url() {
 # them avoids the full plugin bootstrap (heavy plugins such as event-tickets or
 # gravityforms can exhaust memory and make wp exit non-zero) and is also the
 # recommended way to run search-replace.
-wp_cli() { ddev wp --skip-plugins --skip-themes "$@"; }
+wp_cli() { ddev wp --skip-plugins --skip-themes "$@" </dev/null; }
 
 # Raw SQL as root against this project's database. stdin from /dev/null so the
 # client can't drain the menu's own stdin when the script is driven from a pipe.
@@ -172,6 +178,7 @@ $ddev_settings = dirname(__FILE__) . '/wp-config-ddev.php';
 if (getenv('IS_DDEV_PROJECT') === 'true' && is_readable($ddev_settings)) {
     require_once($ddev_settings);
 }
+
 SNIPPET
 }
 
@@ -363,7 +370,7 @@ import_database_pantheon() {
 
   # The machine token lives in ~/.ddev/global_config.yaml web_environment and is
   # injected into the web container; we never read or print it here.
-  if ! ddev exec 'test -n "${TERMINUS_MACHINE_TOKEN:-}"' >/dev/null 2>&1; then
+  if ! ddev exec 'test -n "${TERMINUS_MACHINE_TOKEN:-}"' >/dev/null 2>&1 </dev/null; then
     echo
     echo "TERMINUS_MACHINE_TOKEN isn't set in the web container."
     echo "Add it once, globally:"
@@ -471,7 +478,7 @@ EOF
     rm -f "${dest}"
     terminus backup:get "${target}" --element=database --to="${dest}"
     ls -lh "${dest}"
-  ' -- "$site" "$env_name" "$PANTHEON_BACKUP_MAX_AGE_SECONDS" "/var/www/html/$PANTHEON_DUMP_REL"; then
+  ' -- "$site" "$env_name" "$PANTHEON_BACKUP_MAX_AGE_SECONDS" "/var/www/html/$PANTHEON_DUMP_REL" </dev/null; then
     echo "[ERROR] Pantheon download failed — the local database is untouched."
     return 1
   fi

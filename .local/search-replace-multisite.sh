@@ -69,7 +69,9 @@ if ! command -v ddev >/dev/null 2>&1; then
   exit 1
 fi
 
-if ! ddev exec true >/dev/null 2>&1; then
+# stdin from /dev/null: `ddev exec` forwards the caller's stdin into the
+# container, which would otherwise swallow this script's own prompts.
+if ! ddev exec true >/dev/null 2>&1 </dev/null; then
   echo "[ERROR] The DDEV site isn't running. Start it with 'ddev start' first." >&2
   exit 1
 fi
@@ -93,7 +95,7 @@ db_query() { ddev mysql -N -B -e "$1" </dev/null | tr -d '\r'; }
 
 # --skip-plugins / --skip-themes keeps the bootstrap light and is the recommended
 # way to run search-replace (heavy plugins can exhaust memory and abort it).
-wp_cli() { ddev wp --skip-plugins --skip-themes "$@"; }
+wp_cli() { ddev wp --skip-plugins --skip-themes "$@" </dev/null; }
 
 # Strip scheme + trailing slash, leaving a bare host[/path]. "https://x.org/" -> "x.org"
 bare_host() { printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/+$##'; }
@@ -121,7 +123,7 @@ fi
 
 # Default target: whatever DDEV actually serves this project at.
 if [[ -z "$NEW_URL" ]]; then
-  NEW_URL="$(ddev exec printenv DDEV_PRIMARY_URL 2>/dev/null | tr -d '\r\n')"
+  NEW_URL="$(ddev exec printenv DDEV_PRIMARY_URL 2>/dev/null </dev/null | tr -d '\r\n')"
   if [[ -z "$NEW_URL" ]]; then
     echo "[ERROR] Could not read DDEV_PRIMARY_URL from the web container." >&2
     echo "        Pass the new URL explicitly: $(basename "$0") <old> <new>" >&2

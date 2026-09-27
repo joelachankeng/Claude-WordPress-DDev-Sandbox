@@ -1,17 +1,25 @@
-# Claude WordPress Docker Sandbox
+# Claude WordPress DDEV Sandbox
 
-## _A WordPress + MariaDB development sandbox that runs Claude Code in dangerous mode alongside the site, with Playwright browser automation against the live container._
+## _A WordPress development sandbox built on DDEV, with a Playwright browser you can watch and take over from, for Claude Code to work against._
 
-[![Made with Docker](https://img.shields.io/badge/Made%20with-Docker-2496ED?logo=docker&logoColor=white)](#)
+[![Made with DDEV](https://img.shields.io/badge/Made%20with-DDEV-02A8E2?logo=ddev&logoColor=white)](#)
 [![WordPress](https://img.shields.io/badge/WordPress-21759B?logo=wordpress&logoColor=white)](#)
 [![MariaDB](https://img.shields.io/badge/MariaDB-003545?logo=mariadb&logoColor=white)](#)
-[![WSL2](https://img.shields.io/badge/Platform-WSL2-0078D6?logo=windows&logoColor=white)](#)
+[![Playwright](https://img.shields.io/badge/Playwright-2EAD33?logo=playwright&logoColor=white)](#)
 [![Claude](https://img.shields.io/badge/Claude-D97757?logo=claude&logoColor=fff)](#)
 [![Bash](https://img.shields.io/badge/Bash-4EAA25?logo=gnubash&logoColor=fff)](#)
 
-This project spins up a self-contained WordPress development environment — WordPress (PHP 8.2 + Apache), MariaDB, wp-cli, and Claude Code — as a single Docker Compose stack on WSL2. Claude runs in the same compose network as the WP and DB containers, so it can hit the live site over `http://wordpress/` with Playwright, run `wp` commands, query the database, and edit your theme/plugin code — all without touching your real machine.
+This project turns any WordPress codebase into a DDEV sandbox that Claude Code can
+work in: WordPress on nginx with PHP 8.2, MariaDB, WP-CLI, Mailpit, and a real
+Chromium that Claude drives with Playwright — and that **you** can connect to over
+RDP whenever a human needs to take the wheel.
 
-It is generic enough for any WordPress project but follows the Pantheon `wp-config.local.php` + `PANTHEON_ENVIRONMENT` convention, so a site cloned from Pantheon (or any host that uses the same pattern) drops in cleanly.
+It is generic enough for any WordPress project but leans towards Pantheon: a
+Pantheon `wp-config.php` drops in cleanly, and the database can be pulled straight
+from a Pantheon environment with one menu option.
+
+> **Migrating from the Docker Compose version of this sandbox?** See
+> [What changed from the Docker version](#what-changed-from-the-docker-version).
 
 ## Table of Contents
 
@@ -24,454 +32,734 @@ It is generic enough for any WordPress project but follows the Pantheon `wp-conf
 - [Workflow A — Drop scaffolding into an existing WP project](#workflow-a--drop-scaffolding-into-an-existing-wp-project)
 - [Workflow B — Clone this repo, add WP into it](#workflow-b--clone-this-repo-add-wp-into-it)
 - [site-control.sh](#site-controlsh)
+- [Reaching the site from Windows](#reaching-the-site-from-windows)
+- [The browser](#the-browser)
+- [Pulling the database from Pantheon](#pulling-the-database-from-pantheon)
 - [Image processing (GD / Imagick)](#image-processing-gd--imagick)
 - [Logging DB changes](#logging-db-changes)
-- [Playwright and the `http://wordpress/` hostname](#playwright-and-the-httpwordpress-hostname)
 - [Project-specific instructions](#project-specific-instructions)
 - [Sandbox mu-plugins](#sandbox-mu-plugins)
 - [Email capture (Mailpit)](#email-capture-mailpit)
 - [Page cache (stale pages in the browser)](#page-cache-stale-pages-in-the-browser)
-- [Login Token](#login-token)
-- [VcXsrv Setup](#vcxsrv-setup)
+- [Compiling SASS](#compiling-sass)
 - [Scripts](#scripts)
 - [MCP Servers](#mcp-servers)
 - [.env Protection](#env-protection)
-- [Sessions](#sessions)
 - [Multiple Projects](#multiple-projects)
+- [What changed from the Docker version](#what-changed-from-the-docker-version)
 - [Development](#development)
 - [Disclaimer](#disclaimer)
 - [License](#license)
 
 ## Problem
 
-Two problems, one solution.
+**Local WordPress development is fiddly, and it is fiddly once per project.** You
+want a real WP install, a real database, WP-CLI, a real browser that can reach the
+dashboard, mail you can read instead of mail that vanishes, and the ability to drop
+in a production SQL dump. Setting that up by hand is annoying; setting it up five
+times for five client sites is worse.
 
-**1. Claude Code with `--dangerously-skip-permissions` is risky on your real machine.** That flag lets Claude edit files and run commands without stopping to ask. Great for letting it work uninterrupted — bad if it (or any package it pulls in) does something you didn't want. Supply-chain attacks on npm, PyPI, and Composer are real and frequent. The moment Claude installs or runs that code, it is running on your machine too [(see disclaimer)](#disclaimer).
+**And an AI agent working in it needs more than a screenshot.** It needs to run
+`wp` commands, query the database, edit theme files, and drive a browser through
+real flows — while you keep the ability to step in when something needs a human,
+like a captcha, a federated login, or a password you would rather not type into a
+chat window.
 
-**2. Local WordPress development is fiddly.** You want a real WP install, a real database, wp-cli, a real browser that can hit the dashboard, and ideally the ability to swap in a SQL dump from production. Setting that up by hand — and re-setting it up per project — is annoying.
-
-This project solves both at once. Claude gets hands-off autonomy without the keys to your actual machine, and you get a clean WordPress + MariaDB + wp-cli sandbox to point it at.
+The previous version of this project solved the first problem with a hand-built
+Docker Compose stack. DDEV already does that job, better and with less to maintain,
+so this version delegates to it and spends its own complexity on the second problem.
 
 ## Solution
 
-- **One compose stack with four services on a shared network:** `claude` (Node 22 + Claude Code + wp-cli + Playwright), `wordpress` (php8.2-apache on port 8080), `db` (MariaDB 11), and `mailpit` (mail catcher on port 8025). A fifth `wp-cli` service runs one-off wp commands.
-- **Project root is the WordPress install.** The repo root is bind-mounted to `/var/www/html` (Apache's docroot) and `/workspace` (Claude's working dir). Editing files in your editor, on the host, or via Claude all hits the same files.
-- **Claude reaches the site by hostname.** From inside the `claude` container, `http://wordpress/` resolves over the compose network to the WP container. Use that with Playwright — not `localhost:8080`.
-- **wp-cli baked into the Claude image.** Claude can run `wp post list`, `wp search-replace`, `wp option get`, etc. directly, against the live DB.
-- **GD and Imagick everywhere PHP runs.** Both WordPress image editors work in all three PHP environments — the Claude image installs `php-gd` + `php-imagick` for its own php-cli, and the `wp-cli` image is patched to restore the ImageMagick coders upstream leaves out — so `wp media regenerate`, `wp media import`, and plugin thumbnailing work from any of them. `.local/check-image-support.php` verifies it. See [Image processing](#image-processing-gd--imagick).
-- **`site-control.sh` interactive menu** for the stuff you do outside Claude: start/stop services, generate a `wp-config.local.php`, import a SQL dump (`.sql` / `.sql.gz` / `.zip`), search-replace URLs, and create an `admin/admin` user.
-- **Pantheon-friendly `wp-config.local.php` pattern.** A generated `wp-config.local.php` is gated by `PANTHEON_ENVIRONMENT=local`, which the compose file sets for the WP and wp-cli services. Your committed `wp-config.php` stays untouched on prod.
-- **Mail is captured, never sent.** Every `wp_mail()` is routed over SMTP to the `mailpit` container by an auto-installed mu-plugin, so password resets and notifications are readable at [http://localhost:8025](http://localhost:8025) instead of vanishing into a PHP `mail()` with no MTA behind it — and nothing reaches a real inbox.
-- **Dynamic `WP_HOME` / `WP_SITEURL`.** Derived from the request `Host` header so the site responds correctly at both `http://localhost:8080` (host browser) and `http://wordpress/` (sibling containers like Playwright) without 301-redirecting.
-- **`DB_CHANGES.MD` log.** A required append-only record of every dashboard change (posts, pages, settings, plugins, themes, menus, widgets, users) so the sandbox state stays reproducible — see [.local/CLAUDE-LOCAL.md](./.local/CLAUDE-LOCAL.md) for the rule.
-- **All the original sandbox protections still apply.** Claude runs with `--dangerously-skip-permissions` inside the container, Playwright MCP forwards the headed browser to your Windows desktop via VcXsrv, your OAuth login is persisted, sessions back up across rebuilds, and `.env` is locked down with hooks + deny rules.
+- **DDEV owns the environment.** WordPress on nginx-fpm with PHP 8.2, MariaDB 11.8,
+  WP-CLI, Composer, Node, Mailpit, Xdebug and XHProf all come from DDEV. There is no
+  Dockerfile to maintain for any of it.
+- **No `name:` in `.ddev/config.yaml`,** so DDEV derives the project name from the
+  directory. Copy this scaffolding into another site and it becomes its own project
+  at `https://<directory-name>.ddev.site` with no edits — and because DDEV routes
+  everything through one shared router, **any number of sandboxes run at once**.
+- **The project root is the docroot,** matching Pantheon's layout. Your theme is at
+  `wp-content/themes/<yours>/` and WordPress core sits at the top level.
+- **A browser you can share with the agent.** Playwright drives a headed Chromium on
+  a persistent virtual display; you reach it over RDP. Log in by hand, disconnect,
+  and automation continues in the same browser with your session intact. See
+  [The browser](#the-browser).
+- **HTTPS that is genuinely trusted,** including inside Chromium — which needs more
+  than `mkcert -install` alone. See [Requirements](#requirements).
+- **Mail is captured, never sent.** DDEV's Mailpit catches ordinary `wp_mail()` with
+  no configuration, and a mu-plugin blocks the one case DDEV misses: a site's own
+  SMTP plugin relaying real mail with credentials that arrived in a production
+  database dump.
+- **`site-control.sh` interactive menu** for the jobs you do outside Claude: start
+  and stop, generate the DDEV WordPress config, import a SQL file, pull the database
+  from Pantheon, search-replace URLs (single site and multisite), refresh the admin
+  user, and compile or watch SASS.
+- **Pull-only Pantheon integration.** `ddev push pantheon` is disabled on purpose;
+  pushing is a manual job done from a trusted checkout.
+- **`DB_CHANGES.MD` log.** A required append-only record of every dashboard change so
+  the sandbox state stays reproducible — see
+  [.local/CLAUDE-LOCAL.md](./.local/CLAUDE-LOCAL.md).
+- **`.env` is locked down** with permission deny rules and a PreToolUse hook, and the
+  same protection covers `.local/.playwright-secrets` — credentials the browser may
+  use but Claude may not read.
 
 ## Layout
 
 ```
 .
 ├── .claude/
-│   ├── hooks/                      # PreToolUse hooks (deny .env reads)
-│   ├── settings.json               # Hook wiring + permission deny list
-│   └── settings.local.json         # Local allow list + MCP toggles
+│   ├── hooks/                      # PreToolUse hooks (deny .env / secrets reads)
+│   │   ├── deny-env-reads.sh
+│   │   ├── deny-env-reads.ps1
+│   │   └── _hook_tests.sh          # developer harness for the hook
+│   └── settings.json               # Hook wiring + permission deny list
+├── .ddev/
+│   ├── config.yaml                 # Project config — deliberately has no `name:`
+│   ├── providers/pantheon.yaml     # Pull-only; push commands removed
+│   ├── web-build/Dockerfile        # Pins the SASS toolchain into the web image
+│   └── web-entrypoint.d/
+│       └── 10-sandbox-mu-plugins.sh  # Installs the mu-plugins on every start
 ├── .local/
 │   ├── CLAUDE-LOCAL.md             # The sandbox's Claude rules — imported by root CLAUDE.md
-│   ├── Dockerfile                  # Claude container image (Node 22 + wp-cli + Playwright + GD/Imagick)
-│   ├── Dockerfile.wp-cli           # wordpress:cli + the ImageMagick coders it ships without
-│   ├── docker-compose.yml          # claude + wordpress + db + mailpit (+ wp-cli) services
-│   ├── wp-mu-plugins/              # installed to wp-content/mu-plugins/local-mu-plugins/ on start
-│   │   ├── 00-sandbox-mailpit.php  # routes wp_mail() to the mailpit catcher
-│   │   └── 01-sandbox-page-cache.php # drops the Pantheon page-cache TTL to 0
-│   ├── compose.sh                  # docker-compose wrapper that pins COMPOSE_PROJECT_NAME
-│   ├── .mcp.json                   # Playwright MCP config
-│   ├── start-claude-dangerously.sh
-│   ├── start-claude-normal.sh
-│   ├── rebuild-claude.sh
-│   ├── restore-sessions.sh
-│   ├── prune-playwright-mcp.sh
-│   ├── site-control.sh             # Interactive menu: power, wp-config, import, search-replace, admin, sass, CLI update
-│   ├── check-image-support.php     # Verifies GD + Imagick actually process images in a container
-│   ├── wp-config-local.php         # Template used by site-control.sh option 3
-│   ├── wp-config.local.php         # Generated copy (also serves as a working default)
-│   ├── .claude-sessions/           # Session backups (created on demand)
-│   └── .playwright-mcp/            # Screenshot output (auto-pruned)
-├── wp-config.local.php             # Generated into project root by site-control.sh
-├── .env                            # Your OAuth token — never read by Claude
-├── .env.example
-├── CLAUDE.md                       # Yours — a stub importing the file above, plus your site's own rules
-├── DB_CHANGES.MD                   # Append-only log of dashboard changes
+│   ├── bootstrap-vm.sh             # ONE-TIME machine setup (display, browser, certs, RDP)
+│   ├── display.sh                  # Manage the persistent virtual display
+│   ├── playwright-mcp.sh           # MCP server launcher (referenced by .mcp.json)
+│   ├── site-control.sh             # The interactive menu
+│   ├── search-replace-multisite.sh # Network-aware URL rewrite
+│   ├── prune-playwright-mcp.sh     # Screenshot housekeeping
+│   ├── check-image-support.php     # Verifies GD + Imagick really process images
+│   ├── windows/
+│   │   └── Setup-DdevPortProxy.ps1 # Run on Windows: reach the sites + trust the CA
+│   ├── wp-mu-plugins/
+│   │   ├── 00-sandbox-mail-guard.php   # Stops a site's SMTP plugin sending real mail
+│   │   └── 01-sandbox-page-cache.php   # Drops the Pantheon page-cache TTL to 0
+│   ├── DOC/
+│   │   ├── DB_CHANGES.MD           # Append-only log of dashboard changes
+│   │   └── audit-accessibility/    # a11y audit skill
+│   ├── .playwright-profile/        # Per-project browser profile (git-ignored)
+│   └── .playwright-secrets         # Optional dotenv for the browser (git-ignored, never read by Claude)
+├── .sass/
+│   ├── sass.sh                     # Host entry point; hands off to the web container
+│   ├── sass-runner.js
+│   └── SASS.settings.json
+├── .mcp.json                       # Project-scoped MCP servers (auto-discovered)
+├── CLAUDE.md                       # Yours — a stub importing .local/CLAUDE-LOCAL.md
 └── README.md
 ```
 
-Everything sandbox-related lives in `.local/`. The project root is what gets bind-mounted into the containers — as `/workspace` (Claude) and `/var/www/html` (WordPress).
+Everything sandbox-related lives in `.local/`, `.ddev/` and `.sass/`. DDEV's nginx
+denies dotted paths, so none of them are reachable over HTTP.
 
 ## Tech
 
-- [Docker Desktop](https://www.docker.com/products/docker-desktop/) (with WSL2 integration enabled)
-- [WordPress](https://hub.docker.com/_/wordpress) — `wordpress:php8.2-apache` (web) and `wordpress:cli` (one-off wp-cli)
-- [MariaDB 11](https://hub.docker.com/_/mariadb)
-- [Mailpit](https://mailpit.axllent.org/) — `axllent/mailpit`, SMTP sink + web UI for reading captured mail
-- [Node.js 22 (bookworm-slim)](https://hub.docker.com/_/node) — Claude container base
+- [DDEV](https://ddev.com/) — the whole environment: nginx-fpm, PHP 8.2, MariaDB 11.8,
+  WP-CLI, Composer, Node 24, Mailpit, Xdebug, XHProf, mkcert-backed HTTPS
+- [WordPress](https://wordpress.org/) — your own codebase
+- [Playwright](https://playwright.dev/) + [@playwright/mcp](https://www.npmjs.com/package/@playwright/mcp) — browser automation
+- [Xvfb](https://www.x.org/) + [openbox](http://openbox.org/) + [x11vnc](https://github.com/LibVNC/x11vnc) + [xrdp](https://www.xrdp.org/) — the persistent display you connect to
 - [Claude Code](https://docs.claude.com/en/docs/claude-code/overview)
-- [WP-CLI](https://wp-cli.org/) — phar baked into the Claude image, plus the dedicated `wp-cli` compose service
-- [@playwright/mcp](https://www.npmjs.com/package/@playwright/mcp) — pinned to `0.0.75` in both the image and `.mcp.json`
-- [VcXsrv](https://sourceforge.net/projects/vcxsrv/) — X server for the headed browser window
+- [Terminus](https://docs.pantheon.io/terminus) — bundled in DDEV's web container, used for the Pantheon pull
 
 ## Requirements
 
-- Windows 11 (or Windows 10) with WSL2 installed and a Linux distro available.
-- Docker Desktop with **WSL integration enabled** for your distro (Settings → Resources → WSL integration).
-- VcXsrv installed on the Windows side (see [VcXsrv Setup](#vcxsrv-setup)). Optional if you do not need the Playwright browser window.
-- `bash`, `docker`, and standard GNU userland inside WSL.
+- **A Linux machine or VM** with Docker and [DDEV](https://docs.ddev.com/en/stable/users/install/ddev-installation/)
+  installed. This was built on a Debian 13 Hyper-V VM.
+- **`bash` and a standard GNU userland.** `sudo` is needed once, for
+  `bootstrap-vm.sh`.
+- **An RDP client** on whatever machine you sit at, if you want to watch or take over
+  the browser. Windows' built-in Remote Desktop Connection is fine.
+
+A note on HTTPS, because it has a trap in it. DDEV serves every project over HTTPS
+using a certificate from mkcert's local CA. `mkcert -install` puts that CA in the
+system trust store, which is enough for `curl` — but **Chromium does not read the
+system store.** It uses its own NSS database at `~/.pki/nssdb`, and if that database
+does not exist yet, `mkcert -install` silently skips it. The result is Playwright
+failing every navigation with `ERR_CERT_AUTHORITY_INVALID` while `curl` on the same
+machine works perfectly. `bootstrap-vm.sh` creates the database and adds the CA, which
+is the right fix; launching the browser with `--ignore-certificate-errors` would
+"work" by turning off TLS validation everywhere, and is not what this does.
 
 ## Installation
 
-From a WSL shell, in the project root:
+Run the one-time machine setup from the project root:
 
 ```bash
-# Build the Claude image (or skip — the start scripts auto-build if missing)
-( cd .local && docker compose build claude )
+./.local/bootstrap-vm.sh
 ```
 
-Then set up your OAuth login token (see [Login Token](#login-token)) and pick a workflow below.
+It installs the virtual display packages and `jq`, trusts the local CA in Chromium,
+installs Playwright and Chromium, points xrdp at the persistent display, and starts
+it. It asks for `sudo` where it needs it, says what it is about to do, and is safe to
+re-run — every step checks before acting.
+
+Run it **once per machine**, not once per project. Everything it sets up is shared by
+every sandbox on the box.
+
+Then pick a workflow below.
 
 ## Workflow A — Drop scaffolding into an existing WP project
 
-You already have a WordPress codebase (e.g. cloned from Pantheon or GitHub) and want to give Claude a sandboxed local environment.
+You already have a WordPress codebase (cloned from Pantheon or GitHub) and want to
+give Claude a sandboxed local environment.
 
 1. Copy these into the root of your WP project:
+   - `.ddev/` (whole directory)
    - `.local/` (whole directory)
    - `.claude/` (whole directory)
-   - `CLAUDE.md` — **first time only.** After setup this file is yours to write in; re-copying it on a later update would wipe what you added. The sandbox's own rules ride along inside `.local/`, so updating `.local/` keeps them current on its own. See [Project-specific instructions](#project-specific-instructions).
-   - `DB_CHANGES.MD`
-   - `.env.example` → rename to `.env` and fill in your OAuth token
-   - `.gitignore` entries from this repo's `.gitignore` (merge into yours)
-2. Make sure your existing `wp-config.php` knows about the local override. Add this near the top, **before** `wp-settings.php` is included:
-   ```php
-   if (isset($_ENV['PANTHEON_ENVIRONMENT']) && $_ENV['PANTHEON_ENVIRONMENT'] === 'local') {
-     require_once(dirname(__FILE__) . '/wp-config.local.php');
-     return;
-   }
-   ```
-3. Run `./.local/site-control.sh`:
-   - **Option 1** — Power on (starts db + wordpress).
-   - **Option 3** — Generate `wp-config.local.php` in the project root (sandbox DB creds, dynamic `WP_HOME`).
-   - **Option 4** — Import your SQL dump (drop a `.sql` / `.sql.gz` / `.zip` in the project root first).
-   - **Option 5** — Search-replace your prod URL to `http://localhost:8080`.
-   - **Option 6** — Create/refresh an `admin/admin` user.
-4. Visit [http://localhost:8080](http://localhost:8080). Log in as `admin/admin`.
-5. Launch Claude with `./.local/start-claude-dangerously.sh`.
+   - `.sass/` (if you compile SCSS)
+   - `.mcp.json`
+   - `CLAUDE.md` — **first time only.** After setup this file is yours to write in;
+     re-copying it on a later update would wipe what you added. The sandbox's own
+     rules ride along inside `.local/`, so updating `.local/` keeps them current on
+     its own. See [Project-specific instructions](#project-specific-instructions).
+   - `.gitignore` entries from this repo's `.gitignore` (merge into yours — and read
+     the note in there about the `wp-config.php` line, which you will want to drop).
+2. Run `./.local/site-control.sh`:
+   - **Option 1** — Power on. Starts DDEV, creating `.ddev/config.yaml` first if it is
+     somehow missing.
+   - **Option 3** — Generate the DDEV WordPress config. This writes
+     `wp-config-ddev.php` and then makes sure your own `wp-config.php` actually loads
+     it. DDEV will not edit a `wp-config.php` it did not create — it only prints a
+     suggestion — so this option inserts the include for you, above the
+     `wp-settings.php` require, behind a timestamped backup. If your `wp-config.php`
+     hardcodes `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST`, comment those out:
+     whichever is defined first wins.
+   - **Option 4** — Import your SQL dump (drop a `.sql` / `.sql.gz` / `.zip` in the
+     project root first), or **Option 5** to pull it from Pantheon.
+   - **Option 6 / 7** — Search-replace your production URL, if content has it
+     hardcoded. Often unnecessary; see
+     [Pulling the database from Pantheon](#pulling-the-database-from-pantheon).
+   - **Option 8** — Create/refresh the `admin/admin` user.
+3. Visit the URL `ddev describe` prints. From the machine running DDEV it just works;
+   from a different machine see [Reaching the site from Windows](#reaching-the-site-from-windows).
 
 ## Workflow B — Clone this repo, add WP into it
 
 You want a fresh sandbox to drop a WordPress codebase into.
 
-1. `git clone https://github.com/joelachankeng/Claude-WordPress-Docker-Sandbox.git my-wp-sandbox && cd my-wp-sandbox`
-2. Copy your WordPress files into the project root (they sit alongside `.local/`, `.claude/`, etc.). For a brand-new site, the `wordpress:php8.2-apache` image will auto-populate WP core on first boot if the docroot is empty — so an empty project root works too.
-3. `cp .env.example .env` and fill in your OAuth token.
-4. Run `./.local/site-control.sh` and follow the same options as Workflow A starting at step 3.
-5. Visit [http://localhost:8080](http://localhost:8080).
-6. Launch Claude with `./.local/start-claude-dangerously.sh`.
+1. Clone this repository and rename the directory to whatever you want the project
+   called — the directory name becomes the DDEV project name and the hostname.
+2. Copy your WordPress files into the project root, alongside `.local/`, `.ddev/` and
+   friends. For a brand-new site, start DDEV and run `ddev wp core download`.
+3. Run `./.local/site-control.sh` and follow the same options as Workflow A.
 
-In both workflows the project root is the WordPress docroot — your theme lives at `wp-content/themes/<yours>/`, your plugins at `wp-content/plugins/`, etc.
+In both workflows the project root is the WordPress docroot.
 
 ## site-control.sh
 
-`./.local/site-control.sh` is the interactive control panel for the WP side of the sandbox. Run it from a WSL shell — it prints a status header and a menu:
+`./.local/site-control.sh` is the interactive control panel for the WordPress side of
+the sandbox. It prints a status header and a menu:
 
 ```
-  1) Power on  (start db + wordpress)
-  2) Power off (stop all services)
-  3) Generate wp-config.local.php
-  4) Import database from SQL file
-  5) Search-replace database URLs (single site)
-  6) Search-replace database URLs (multisite/network)
-  7) Create/refresh sandbox admin user
-  8) Compile SASS
-  9) Watch SASS (Ctrl+C to stop)
- 10) Update Claude CLI (rebuild image with the latest release)
+  1) Power on  (ddev start)
+  2) Power off (ddev stop)
+  3) Generate the DDEV WordPress config
+  4) Import database from a SQL file
+  5) Import database from Pantheon
+  6) Search-replace database URLs (single site)
+  7) Search-replace database URLs (multisite/network)
+  8) Create/refresh sandbox admin user
+  9) Compile SASS
+ 10) Watch SASS (Ctrl+C to stop)
   q) Quit
 ```
 
-- **Power on/off** — `docker compose up -d db wordpress` / `docker compose down` against the pinned project name.
-- **Generate `wp-config.local.php`** — renders `.local/wp-config-local.php` (a template) into the project root with sandbox DB creds (`db/db/db@db`) and a `WP_HOME` that auto-derives from `$_SERVER['HTTP_HOST']`. Includes a `#.local-generated` marker so future runs warn before overwriting a hand-edited copy.
-- **Import a SQL dump** — lists every `*.sql` / `*.sql.gz` / `*.gz` / `*.zip` in the project root, drops + recreates the `db` database, and pipes the dump into MariaDB. Useful for pulling a prod export down.
-- **Search-replace URLs** — runs `wp search-replace` across all tables (skipping `guid`) via the `wp-cli` compose service. Auto-detects the current `siteurl`, defaults the new value to `http://localhost:8080`. Retries on db connection failure so you can fix `wp-config.php` and continue.
-- **Search-replace URLs (multisite)** — delegates to `.local/search-replace-multisite.sh`, which boots wp-cli against the old host still in the DB and also rewrites the protocol-less domain columns in `wp_blogs` / `wp_site` / `wp_sitemeta`. Use this instead of option 5 for a network install.
-- **Create/refresh admin user** — creates `admin/admin/admin@admin.com` as an administrator via wp-cli, with a direct-SQL fallback (MD5 password; WP rehashes on next login) if wp-cli can't connect.
-- **Compile / watch SASS** — runs `.sass/sass.sh` inside the sandbox (the image bakes in Dart Sass, PostCSS, and Autoprefixer). Requires the stack to be powered on.
-- **Update Claude CLI** — reads the version currently baked into `claude-dangerous:<project>`, asks the npm registry for the latest `@anthropic-ai/claude-code`, and rebuilds the image pinned to it. The Dockerfile installs the CLI in its own final layer with a `CLAUDE_CODE_VERSION` build arg, so only that layer is invalidated — the apt and Chrome layers stay cached and the rebuild takes seconds. A Claude session that is already running keeps the old version until it exits; restart with `start-claude-dangerously.sh` to pick up the new one.
+- **Power on/off** — `ddev start` / `ddev stop`. Note `stop` is per-project and keeps
+  the database; `ddev poweroff` would stop every project on the machine. There is no
+  port-conflict check any more because there are no per-project ports to conflict.
+- **Generate the DDEV WordPress config** — see Workflow A step 3.
+- **Import a SQL dump** — lists every `*.sql` / `*.sql.gz` / `*.gz` / `*.zip` in the
+  project root with its size and hands the chosen one to `ddev import-db`, which
+  drops the existing tables and understands all those formats natively.
+- **Import from Pantheon** — see [Pulling the database from Pantheon](#pulling-the-database-from-pantheon).
+- **Search-replace URLs** — detects the current `siteurl` and rewrites both the
+  `https://` and `http://` forms of it to this project's DDEV URL, across all tables,
+  skipping `guid`. Doing both schemes matters: a production dump is usually `https`
+  while older content often holds `http` links, and missing one leaves mixed URLs.
+- **Search-replace URLs (multisite)** — delegates to
+  `.local/search-replace-multisite.sh`. Use this instead of option 6 for a network.
+  It exists because a network needs two things option 6 cannot do: boot WP-CLI against
+  the *old* host still present in `wp_blogs` (otherwise the multisite bootstrap fatals
+  with "Site not found" and nothing runs at all), and rewrite the protocol-less domain
+  columns in `wp_blogs` / `wp_site` / `wp_sitemeta` that a full-URL replace never
+  touches.
+- **Create/refresh admin user** — `admin` / `admin` / `admin@admin.com` as an
+  administrator via WP-CLI, with a direct-SQL fallback (MD5 password; WordPress
+  rehashes on next login) for when WP-CLI cannot bootstrap.
+- **Compile / watch SASS** — see [Compiling SASS](#compiling-sass).
 
-The DB defaults wired into both compose and this script are `db_name=db`, `db_user=db`, `db_password=db`, `db_root_password=root`. They're sandbox-only — don't reuse them.
+The sandbox database credentials are DDEV's defaults: `db`/`db`/`db`, plus
+`root`/`root`. They are sandbox-only — don't reuse them.
+
+## Reaching the site from Windows
+
+If you sit at a different machine from the one running DDEV — a Windows host with the
+sandbox on a Linux VM, say — the sites are not reachable out of the box, and neither
+is the HTTPS certificate trusted. Two things fix that, and **you only ever set them
+up once, for every project you will ever create**:
+
+```powershell
+# In an ADMINISTRATOR PowerShell on Windows, from the project directory:
+.local\windows\Setup-DdevPortProxy.ps1 -CaCertPath C:\temp\rootCA.pem
+```
+
+The script leans on a useful fact: `*.ddev.site` is a **real public DNS wildcard that
+already resolves to `127.0.0.1` everywhere**, including on Windows. So Windows is
+already sending `anything.ddev.site` to its own loopback — there is just nothing
+listening there. The script adds two `netsh portproxy` rules relaying loopback `80`
+and `443` to the VM:
+
+```
+browser -> myproject.ddev.site -> 127.0.0.1:443 -> VM:443 -> traefik -> the right project
+```
+
+Because the relay is plain TCP, the `Host` header and TLS SNI reach the VM untouched,
+so DDEV's router picks the right project. A new project needs **no configuration at
+all** — `ddev start` and it is reachable.
+
+This is worth contrasting with the obvious approach: the Windows `hosts` file has no
+wildcard support, so going that route really would mean one line per project, added
+as administrator each time. Two rules beat N lines.
+
+It also imports the VM's mkcert root CA into the Windows Trusted Root store. Without
+that, every `https://*.ddev.site` page shows a certificate error Chromium will not let
+you click through. Get the certificate off the VM with:
+
+```bash
+cat "$(mkcert -CAROOT)/rootCA.pem"
+```
+
+and paste it into a file on Windows, or copy it across over the RDP clipboard.
+
+Two caveats:
+
+- **You also need `router_bind_all_interfaces`** so DDEV's router listens beyond
+  loopback on the VM: `ddev config global --router-bind-all-interfaces`. Be aware this
+  exposes Mailpit's ports to the network too, which DDEV's own docs flag; on a
+  host-only VM network that is narrow, but worth a firewall rule if yours is broader.
+- **Re-run the script if the VM's IP changes.** Hyper-V's Default Switch hands out
+  DHCP addresses that can change when Windows reboots. The script resolves the VM by
+  name (`<hostname>.mshome.net`, which Hyper-V registers) rather than hardcoding an
+  address, so re-running is all it takes. Give the VM a static address if you would
+  rather not think about it.
+
+## The browser
+
+Two browsers are in play, and they are good at different things.
+
+### Playwright (the default)
+
+Wired up through `.mcp.json` → `.local/playwright-mcp.sh`. It runs **on the machine
+hosting DDEV**, which is what makes it work: it can reach `https://*.ddev.site`, and
+it trusts the local CA. It also gives you isolated browser contexts — genuine
+incognito, with separate cookie jars — plus request interception, uploads and
+downloads.
+
+It runs **headed** on a shared virtual display, so you can watch it and take over.
+
+### Taking over the browser
+
+1. Connect an RDP client to the VM on port `3389` and choose the **"Sandbox Browser"**
+   session.
+2. You are looking at the virtual desktop the browser lives on. Log in, solve the
+   captcha, type the password.
+3. Disconnect. **The browser stays running** and automation continues with your
+   session intact — it is the same browser, not a copy.
+
+That last point is why the display is persistent rather than owned by your RDP
+session: an RDP-session-owned browser dies when you disconnect, and its `DISPLAY`
+number changes on every connect.
+
+```bash
+.local/display.sh status   # what is running, and which windows are open
+.local/display.sh up       # start it (safe to re-run)
+.local/display.sh down     # stop it — closes EVERY project's browser
+```
+
+The display is **shared** by every sandbox on the machine. That is deliberate: a
+display is a screen, not a browser slot, so each project's browser is just another
+window on one desktop and one RDP session shows you all of them. What is
+**per-project** is the browser *profile* (`.local/.playwright-profile/`), because that
+is what actually collides — Chromium refuses to open a second instance against the
+same profile directory.
+
+If the display cannot start, the MCP server falls back to headless rather than
+failing. Force headless with `SANDBOX_PLAYWRIGHT_HEADLESS=1`.
+
+### Credentials you don't want in the chat
+
+Create `.local/.playwright-secrets` as a dotenv file and the MCP server is started
+with `--secrets` pointing at it, so the **browser** can use those values while Claude
+cannot read the file. The `.env` deny rules and the PreToolUse hook both cover it, and
+it is git-ignored.
+
+### Claude Code's own browser
+
+If your Claude Code client has a built-in browser, it is useful for showing you
+something — but know its limits before relying on it. When the client runs on a
+different machine from DDEV, it **cannot reach that machine's `localhost`** and will
+only see the site once the port proxy above is in place. And all of its tabs typically
+**share one cookie jar**, so you cannot be logged in as admin in one tab and anonymous
+in another. Use Playwright contexts for that.
+
+## Pulling the database from Pantheon
+
+Menu **option 5** imports the database straight from a Pantheon environment. It asks
+which environment to use (`live`, `test`, `dev`, or a multidev branch), remembers the
+site name in `.ddev/config.local.yaml` (which DDEV git-ignores), and never touches
+files — code and uploads come from git.
+
+The backup rule is: **reuse Pantheon's newest database backup if it is less than 24
+hours old, and only create a new one when it is not.** DDEV's own provider has no mode
+for this — it either grabs the newest existing backup regardless of age
+(`DDEV_USE_PANTHEON_BACKUP=true`) or streams a fresh `mysqldump` off the live database,
+which is slow — so the freshness check is implemented in `site-control.sh`.
+
+Setup is a one-time global step:
+
+```bash
+ddev config global --web-environment-add="TERMINUS_MACHINE_TOKEN=<token>"
+ddev restart
+```
+
+Generate the token at the Pantheon dashboard under Account → Machine Tokens. Terminus
+itself is already in DDEV's web container.
+
+**After importing, search-replace is usually unnecessary.** `wp-config-ddev.php`
+defines `WP_HOME` and `WP_SITEURL` from DDEV, and those **override whatever URL is in
+the database**, so the site is browsable immediately. You need option 6 only for URLs
+hardcoded in post content, and option 7 for a multisite network, where `wp_blogs` and
+`wp_site` store bare domains that no constant can override. Option 5 offers both when
+it finishes.
+
+`ddev push pantheon` is **disabled** in `.ddev/providers/pantheon.yaml` — it dropped
+and recreated the remote database, which is not something that should be one typo
+away in a sandbox. The `#ddev-generated` marker is removed from that file so DDEV
+cannot restore it. Push by hand from a trusted checkout.
 
 ## Image processing (GD / Imagick)
 
-WordPress needs one of two PHP extensions to resize anything — Imagick (preferred) or GD (fallback). Both are available in the containers you actually work in:
-
-| Container / image | GD | Imagick |
-| --- | --- | --- |
-| `wordpress` (`wordpress:php8.2-apache`) | ✅ | ✅ |
-| `claude` (built from `.local/Dockerfile`) | ✅ `php-gd` | ✅ `php-imagick` |
-| `wp-cli` (built from `.local/Dockerfile.wp-cli`) | ✅ | ✅ |
-
-So `wp media regenerate`, `wp media import`, thumbnail generation, and plugins that resize images all work — from the site itself, from `wp` inside the Claude container, and from the one-off `wp-cli` service.
-
-To verify, run the checker in whichever container you care about:
+WordPress needs one of two PHP extensions to resize anything — Imagick (preferred) or
+GD (fallback). DDEV's web container has both, with Imagick carrying a full delegate
+set, so `wp media regenerate`, `wp media import`, thumbnail generation and plugin
+resizing all work with no setup. Verify it:
 
 ```bash
-# Claude container
-php .local/check-image-support.php
-
-# wordpress container (it masks /var/www/html/.local, so copy the file in)
-WP=$(./.local/compose.sh ps -q wordpress)
-docker cp .local/check-image-support.php "$WP:/tmp/" && docker exec "$WP" php /tmp/check-image-support.php
+ddev exec php .local/check-image-support.php
 ```
 
-It doesn't just check `extension_loaded()` — a loaded extension with no JPEG delegate still can't resize a media library. Each backend is made to round-trip a real image (create → encode → decode → resize), the reported delegates are checked, and it finishes by asking which editor WordPress itself would choose. Exit code is non-zero if anything fails.
-
-**Why `wp-cli` is built rather than pulled.** The upstream `wordpress:cli` image installs `imagemagick-libs` but not `imagemagick`, the package that carries the coder modules. Imagick loads and reports a version, but `Imagick::queryFormats()` returns an empty array — it can't read or write a single format. WordPress notices and silently falls back to GD, so nothing visibly breaks, which is what makes it easy to miss. `.local/Dockerfile.wp-cli` is a three-line layer on top of the upstream image that installs the missing package, restoring the full ~200-format delegate set. Compose builds it automatically the first time the service runs.
+It round-trips a real image through each backend (create → encode → decode → resize)
+rather than just checking `extension_loaded()`, and exits non-zero on failure.
 
 ## Logging DB changes
 
-The sandbox rules require every change made through the WordPress dashboard (posts, pages, settings, plugins, themes, menus, widgets, users) to be appended to `DB_CHANGES.MD` in chronological order. Entries follow the format already in the file:
-
-```
-## YYYY-MM-DD HH:MM — Short summary
-- **Area:** Posts | Pages | Settings | Plugins | Themes | Menus | Widgets | Users
-- **Change:** what was added/edited/deleted
-- **Details:** object IDs, titles, slugs, option names
-```
-
-This is how the sandbox state stays reproducible after a `rebuild-claude.sh` or a fresh import — you can read the log to see what was done.
-
-## Playwright and the `http://wordpress/` hostname
-
-Inside the Claude container, **always navigate to `http://wordpress/`** — not `http://localhost:8080/`. From within a sibling container, `localhost` refers to that container itself, not the host. The `wordpress` hostname resolves over the compose network straight to the WP container.
-
-`wp-config.local.php` is wired so the site responds correctly at both URLs without 301-redirecting, by deriving `WP_HOME` from the request `Host` header at runtime. This is why both `http://localhost:8080` (your host browser) and `http://wordpress/` (Playwright inside the Claude container) work without conflict.
-
-The rule is in `.local/CLAUDE-LOCAL.md` so Claude follows it without being reminded.
+Every change made through the WordPress dashboard — posts, pages, settings, plugins,
+themes, menus, widgets, users — must be appended to `.local/DOC/DB_CHANGES.MD`, oldest
+first, never rewritten or reordered. It is the running history that makes the sandbox
+state reproducible. The rule Claude follows is in
+[.local/CLAUDE-LOCAL.md](./.local/CLAUDE-LOCAL.md).
 
 ## Project-specific instructions
 
-This scaffolding is cloned across many sites, and updating it means re-copying `.local/` wholesale. If the sandbox's own rules lived in `CLAUDE.md`, every site that added notes to that file would lose them on the next update.
-
-So the sandbox's rules do not live there. They live in `.local/CLAUDE-LOCAL.md`, and `CLAUDE.md` is reduced to a stub that imports them:
+`CLAUDE.md` in the project root is **yours**. It ships as a stub that imports the
+sandbox's own rules:
 
 ```markdown
 # CLAUDE.md
 
 <!-- THIS IS REQUIRED FOR THE SANDBOX TO WORK PROPERLY --->
-## Claude Docker Sandbox Instructions
+## Claude DDEV Sandbox Instructions
 @.local/CLAUDE-LOCAL.md
 <!-- DO NOT REMOVE ABOVE!!! --->
 ```
 
-`@path` is Claude Code's import syntax: the referenced file is inlined where the line appears, so Claude loads the sandbox rules exactly as if they were pasted into `CLAUDE.md`.
-
-| File | Belongs to | On update |
-|---|---|---|
-| `.local/CLAUDE-LOCAL.md` | the scaffolding | **replaced** along with the rest of `.local/` |
-| `CLAUDE.md` | your site | **untouched** — write whatever you like below the stub |
-
-- **`CLAUDE.md` is yours now.** Add your site's conventions, gotchas, and theme layout straight into it, underneath the import. Nothing in the update path rewrites it.
-- **Keep the stub.** Delete the `@.local/CLAUDE-LOCAL.md` line and Claude loses every sandbox rule at once — the `.env` prohibition, the `http://wordpress/` hostname, the `DB_CHANGES.MD` requirement.
-- **Your rules are read after the sandbox's,** since the import sits above them.
-- **Imports nest** up to five levels, so you can `@`-import per-area notes (a theme conventions file, say) once `CLAUDE.md` gets long.
-
-Run `/memory` inside Claude Code to see exactly which files were loaded, imports included.
+Add your site's conventions below that import — coding standards, which plugins are
+off-limits, deployment quirks. Because the sandbox's rules live in
+`.local/CLAUDE-LOCAL.md`, updating `.local/` keeps them current without touching what
+you wrote.
 
 ## Sandbox mu-plugins
 
-Two behaviours the sandbox needs are supplied as must-use plugins: the Mailpit router and the page-cache override. Both live in `.local/wp-mu-plugins/`, and `.local/wp-entrypoint.sh` installs them on every container start.
-
-They are installed into their own subdirectory so the sandbox's files never mingle with the project's — on a Pantheon site, `wp-content/mu-plugins/` already contains `loader.php` and `pantheon-mu-plugin/`:
+The sandbox's must-use plugins live in `.local/wp-mu-plugins/`. On every web container
+start, `.ddev/web-entrypoint.d/10-sandbox-mu-plugins.sh` installs them here:
 
 ```
 wp-content/mu-plugins/
 ├── 00-local-mu-plugins.php     # generated stub — loads the folder below
-├── local-mu-plugins/           # generated; edit the sources in .local/wp-mu-plugins/
-│   ├── 00-sandbox-mailpit.php
-│   └── 01-sandbox-page-cache.php
-├── loader.php                  # your project's
-└── pantheon-mu-plugin/         # your project's
+└── local-mu-plugins/           # generated copies of .local/wp-mu-plugins/*.php
 ```
 
-- **The stub is required, not decorative.** WordPress does not recurse into mu-plugin subdirectories — `wp_get_mu_plugins()` (`wp-includes/load.php`) `readdir()`s `wp-content/mu-plugins` and takes only the `*.php` sitting directly in it. Without `00-local-mu-plugins.php` the subfolder is inert. Its `00-` prefix also puts it ahead of Pantheon's `loader.php`, which the page-cache filter depends on.
-- **Real files, not bind mounts.** The `wp-cli` and `claude` containers share the docroot but not the entrypoint, so copying the files in is what makes all three containers behave alike.
-- **Generated, so git-ignored.** Both the stub and `local-mu-plugins/` are rewritten on every start — edit the sources in `.local/wp-mu-plugins/`, never the installed copies.
-- **Self-cleaning.** Copies whose source has been renamed or deleted are removed, as are top-level leftovers from the pre-subdirectory layout. Deletion only ever touches files carrying the `#.local-generated` marker, so a project file that happens to match the naming pattern is left alone.
+**Always edit `.local/wp-mu-plugins/`, never `wp-content/mu-plugins/`.** Both
+generated paths are overwritten on every start and are git-ignored; the installer also
+deletes copies whose source is gone, and cleans up copies from the old layout.
+
+Three things to know before changing this:
+
+- **The stub is what makes the subfolder work.** `wp_get_mu_plugins()`
+  (`wp-includes/load.php`) `readdir()`s `wp-content/mu-plugins` and takes only the
+  `*.php` directly inside it — WordPress never recurses. Delete the stub and
+  everything in `local-mu-plugins/` silently stops loading. The subfolder exists to
+  keep sandbox files clearly apart from the project's own, since Pantheon's
+  `loader.php` and `pantheon-mu-plugin/` live in the same directory.
+- **The `00-` prefix is load-bearing.** mu-plugins load in filename order, and
+  `01-sandbox-page-cache.php` must register its filter before Pantheon's `loader.php`
+  constructs `Pantheon_Cache`.
+- **DDEV *sources* the scripts in `.ddev/web-entrypoint.d/`,** it does not execute
+  them. So an `exit` at top level terminates the entrypoint and the container never
+  boots — which is exactly what happened the first time this was written — and `set -e`
+  leaks into the rest of the entrypoint. That is why the installer's body runs inside a
+  subshell. Keep it that way.
+
+Sandbox-only code gates on `getenv('IS_DDEV_PROJECT') === 'true'`, which is set in
+every DDEV web container and nowhere else, so a stray copy on a production host does
+nothing.
 
 ## Email capture (Mailpit)
 
-The `wordpress:php8.2-apache` image has no MTA behind PHP's `mail()`, so out of the box every password reset, new-user notice, and contact-form submission is silently dropped. The `mailpit` service fixes that: it is an SMTP sink with a web UI, so mail is captured and readable, and nothing can reach a real inbox from the sandbox.
+DDEV ships Mailpit inside the web container and points PHP's `sendmail_path` at it:
 
-- **Read your mail** at [http://localhost:8025](http://localhost:8025) from the host browser, or `http://mailpit:8025` from inside a sibling container (Claude, Playwright) — same hostname rule as `http://wordpress/`.
-- **JSON API** for scripted checks — handy for Claude, which can pull a reset link straight out of a message body:
-  ```bash
-  curl -s http://mailpit:8025/api/v1/messages         # list, newest first
-  curl -s http://mailpit:8025/api/v1/message/<ID>     # one message (.Text / .HTML)
-  curl -s -X DELETE http://mailpit:8025/api/v1/messages   # empty the mailbox
-  ```
-- **How the routing works.** `00-sandbox-mailpit.php` hooks `phpmailer_init` and points PHPMailer at `mailpit:1025` over plain SMTP. It is installed as a real file rather than a bind mount so the `wp-cli` and `claude` containers — which share the docroot but not the entrypoint — route mail the same way. See [Sandbox mu-plugins](#sandbox-mu-plugins) for how it gets there.
-- **It cannot leak into production.** The mu-plugin returns immediately unless `PANTHEON_ENVIRONMENT=local`, which only the sandbox services set.
-- **It also fixes the `wordpress@localhost` From address.** WordPress derives that from a `localhost` site URL, and PHPMailer rejects it over SMTP (no dot in the domain), which would make every `wp_mail()` return `false`. The mu-plugin substitutes `wordpress@sandbox.local` when — and only when — the derived address is invalid.
-- **Storage is in-memory,** capped at 500 messages. Stopping the container discards the mailbox.
+```
+sendmail_path = /usr/local/bin/mailpit sendmail -t --smtp-addr 127.0.0.1:1025
+```
 
-If port 8025 is unavailable on your machine (see the note in [Multiple Projects](#multiple-projects)), override it:
+So every `mail()` — and therefore every ordinary `wp_mail()` — is captured with no
+configuration at all. Password resets and registration notices are safe to trigger and
+readable afterwards. Open the UI with `ddev mailpit`, or at
+`https://<project>.ddev.site:8026`. The JSON API is often easier:
 
 ```bash
-MAILPIT_PORT=8225 ./.local/compose.sh up -d db mailpit wordpress
+ddev exec 'curl -s http://127.0.0.1:8025/api/v1/messages'
+ddev exec 'curl -s http://127.0.0.1:8025/api/v1/message/<ID>'
+ddev exec 'curl -s -X DELETE http://127.0.0.1:8025/api/v1/messages'
 ```
+
+**The one case DDEV does not cover** is a site whose own SMTP plugin — WP Mail SMTP,
+Post SMTP, Easy WP SMTP — hooks `phpmailer_init` and points PHPMailer at a real relay,
+typically using credentials that arrived with an imported production database. That
+bypasses `sendmail` entirely, and the sandbox would cheerfully email live customers.
+`.local/wp-mu-plugins/00-sandbox-mail-guard.php` prevents it by forcing every message
+back to Mailpit at `PHP_INT_MAX` priority. The priority is the whole point: mu-plugins
+load before regular plugins, so a hook registered at the normal priority would run
+*first* and be overwritten by the plugin's. Running last makes that impossible.
 
 ## Page cache (stale pages in the browser)
 
-This one only bites on projects that vendor Pantheon's mu-plugin into `wp-content/mu-plugins/` — a plain WordPress install never sends the header, so if your site is not a Pantheon site, `01-sandbox-page-cache.php` registers a filter nothing ever calls and you can ignore this section.
+If a page still shows old markup after you edited a template, suspect the cache before
+you suspect your change. On projects carrying Pantheon's mu-plugin, HTML goes out as
+`cache-control: public, max-age=604800` — a week — and the sandbox has no purge layer
+to invalidate it.
 
-`pantheon-mu-plugin` sends `cache-control: public, max-age=604800` on HTML. On Pantheon that is correct: their edge cache honours it and is purged whenever content changes. The sandbox has no purge layer, so the header lands in **your browser's** cache and stays there for a week. You edit a template, reload, and get the old page with nothing to indicate why. It outlives theme renames and asset moves, so it also serves 404s for files at paths the site abandoned days ago.
+`.local/wp-mu-plugins/01-sandbox-page-cache.php` filters
+`pantheon_cache_default_max_age` to `0` so new requests revalidate every time. It only
+affects requests made *after* it took effect, so a URL cached earlier under the
+week-long header stays stuck until it expires. Reload that URL with cache bypass
+rather than concluding the fix did not work:
 
-`.local/wp-mu-plugins/01-sandbox-page-cache.php` filters `pantheon_cache_default_max_age` to `0`. Load order is load-bearing: the generated stub that pulls it in is named `00-local-mu-plugins.php`, so it runs before Pantheon's `loader.php` constructs `Pantheon_Cache`. See [Sandbox mu-plugins](#sandbox-mu-plugins).
-
-- **`max-age=0` rather than `no-store`.** The response stays cacheable but is immediately stale, so the browser revalidates instead of refusing to store anything — you keep conditional-request efficiency and never see frozen markup.
-- **It cannot slow production down.** Two independent barriers: the file returns early unless `PANTHEON_ENVIRONMENT=local`, which only the sandbox services set; and Pantheon itself clamps any sub-60-second TTL back up to 60 when that variable is `live`.
-- **Pages you already visited stay stuck.** They were cached under the old week-long header, and a response already in the cache is not revisited until it expires. One hard refresh (<kbd>Ctrl/Cmd</kbd>+<kbd>Shift</kbd>+<kbd>R</kbd>) per affected URL clears it; after that they behave normally.
-
-## Login Token
-
-Every time the container starts, Claude asks you to log in. To stop that for good, set up a long-lived login token once. (Its proper name is an OAuth token — "long-lived" just means it does not expire when the session ends.)
-
-There is a trap in the middle of this, so follow the steps in order:
-
-1. Run the token setup command from the project root:
-
-   ```bash
-   ( cd .local && docker compose run --rm claude claude setup-token )
-   ```
-
-2. The terminal prints a URL. Open it in a browser — click it, or copy and paste it.
-
-3. Log in and approve. The browser then shows you a code. **This code is _not_ your long-lived token** — it is a short-lived browser code for the next step.
-
-4. Go back to the terminal, paste in that browser code, and press Enter.
-
-5. Claude exchanges the code and prints your real long-lived token. **It starts with `sk-ant-oat01-`.** If what you have does not start with `sk-ant-`, it is almost certainly the browser code from step 3 — not the token. Run the command again and watch for the `sk-ant-oat01-` line at the very end.
-
-6. Copy `.env.example` to `.env`.
-
-7. Open `.env` and set `CLAUDE_CODE_OAUTH_TOKEN` to the `sk-ant-oat01-` token from step 5.
-
-8. Run `./.local/start-claude-dangerously.sh` (or `start-claude-normal.sh`) to launch Claude in the container. Claude should not prompt you to log in.
-
-9. If Claude still asks you to log in after step 8, the container is probably holding stale credentials from an earlier attempt — an old `.claude` folder and session files cached inside its volume. Run `./.local/rebuild-claude.sh` to wipe the volume and rebuild clean, then repeat step 8.
-
-## VcXsrv Setup
-
-VcXsrv is the X server that lets the container draw the Playwright browser window on your Windows desktop. Without it, Claude still runs and Playwright still works headlessly against `http://wordpress/` — you just will not see the browser.
-
-Install it on the Windows side with [winget](https://learn.microsoft.com/windows/package-manager/winget/) (run from PowerShell or Command Prompt, not WSL):
-
-```
-winget install --id marha.VcXsrv -e --accept-package-agreements --accept-source-agreements
+```js
+fetch(location.href, {cache: 'reload'})
 ```
 
-Then configure it:
+## Compiling SASS
 
-- Launch **XLaunch** from the Start menu.
-- **Display settings:** choose _Multiple windows_, leave the display number at `0`, click Next.
-- **Client startup:** choose _Start no client_, click Next.
-- **Extra settings:** check _Disable access control_ — this is required, or the container cannot connect. Click Next.
-- Click _Save configuration_ to keep an `.xlaunch` file you can double-click next time, then Finish.
-- When Windows Firewall asks, allow VcXsrv on Private networks.
+```bash
+bash .sass/sass.sh compile     # once
+bash .sass/sass.sh watch       # watch for changes
+```
 
-The container reaches VcXsrv via `DISPLAY=host.docker.internal:0.0`, wired up through `--add-host=host.docker.internal:host-gateway` in the start scripts. VcXsrv must be running before you start Claude.
+Run it from the host; it hands off to the web container, where the toolchain lives.
+Run it from inside the container (`ddev ssh`) and it executes the runner directly.
+Entries come from `.sass/SASS.settings.json` — copy
+`.sass/SASS.settings.example.json` to start.
+
+`sass`, `postcss` and `autoprefixer` are pinned in `.ddev/web-build/Dockerfile` and
+installed into `/usr/local/lib/sandbox-sass`, with `NODE_PATH` pointing at it. That
+fixed path is deliberate rather than a plain `npm install -g`: DDEV manages Node with
+`n`, so the global module root is version-dependent and gets replaced whenever
+`nodejs_version` changes in `.ddev/config.yaml` — which would silently strip the
+toolchain. After editing that Dockerfile, run `ddev restart` to rebuild.
 
 ## Scripts
 
-All scripts live in `.local/` and are run from a WSL shell. They derive the Compose project name from the parent directory, so each cloned copy gets its own isolated containers, volumes, and network.
+All in `.local/`, all run from the host.
 
-- **`start-claude-dangerously.sh`** — Launches Claude with `--dangerously-skip-permissions`, joins the project's compose network (so `db` and `wordpress` are reachable by hostname), auto-builds the image if missing, and prunes the Playwright screenshot dir first.
-- **`start-claude-normal.sh`** — Same as above but in normal mode, where Claude asks for approval before edits or shell commands.
-- **`rebuild-claude.sh`** — Deletes this project's `claude` container, the `claude-config` + `claude-cache` volumes, and the `claude-dangerous:latest` image, then rebuilds from scratch with `--no-cache`. Asks for confirmation, offers to back up your sessions to `.local/.claude-sessions/`, and pauses for you to verify that backup (opens the folder in Explorer) before anything is deleted. Auto-starts Docker Desktop from WSL if it is not running. Use it for a clean slate when something breaks. **Does not** touch the `wp-db` volume — your DB survives.
-- **`restore-sessions.sh`** — Copies sessions saved in `.local/.claude-sessions/` back into the container volume and puts a resume prompt on your Windows clipboard via `clip.exe`. See [Sessions](#sessions).
-- **`prune-playwright-mcp.sh`** — Housekeeping for `.local/.playwright-mcp/`: deletes screenshots older than 7 days, then caps the total at 100 files. The start scripts run this automatically; you can run it manually too.
-- **`compose.sh`** — Thin `docker compose` wrapper that exports the same per-project `COMPOSE_PROJECT_NAME` the start scripts use, so any compose op (`up`, `down`, `logs`, `ps`, `exec`) hits the same containers and network. Example: `./.local/compose.sh logs -f wordpress`.
-- **`site-control.sh`** — Interactive WP control panel; see [site-control.sh](#site-controlsh).
-
-To start Claude without a script, from the project root: `( cd .local && docker compose run --rm claude )` for dangerous mode (the compose `command:` includes the flag), or `( cd .local && docker compose run --rm claude claude )` for normal mode. Note that doing it this way will _not_ load `.mcp.json` — the start scripts pass it explicitly with `--mcp-config`.
+- **`bootstrap-vm.sh`** — One-time, per-machine setup: virtual display packages and
+  `jq`, the mkcert CA in Chromium's NSS store, Playwright and Chromium, xrdp pointed at
+  the persistent display. Idempotent; asks for `sudo` where needed.
+- **`site-control.sh`** — The interactive menu; see [above](#site-controlsh).
+- **`display.sh`** — `up` / `ensure` / `down` / `status` for the virtual display.
+  Override `SANDBOX_DISPLAY_NUM`, `SANDBOX_VNC_PORT` or `SANDBOX_SCREEN_GEOMETRY` if you
+  ever want a project on its own screen.
+- **`playwright-mcp.sh`** — Launches the MCP server with the per-project profile, the
+  screenshot output directory, and the headed-or-headless decision. Referenced by
+  `.mcp.json`; you do not normally run it yourself.
+- **`search-replace-multisite.sh`** — Network-aware URL rewrite. Takes `[OLD] [NEW]`,
+  `--dry-run` and `-y`.
+- **`prune-playwright-mcp.sh`** — Deletes screenshots older than 7 days, then caps the
+  directory at 100 files. Run automatically when the MCP server starts.
+- **`check-image-support.php`** — `ddev exec php .local/check-image-support.php`.
+- **`windows/Setup-DdevPortProxy.ps1`** — Run on Windows, elevated. See
+  [Reaching the site from Windows](#reaching-the-site-from-windows).
 
 ## MCP Servers
 
-Playwright MCP is configured in `.local/.mcp.json` and passed to Claude via `--mcp-config /workspace/.local/.mcp.json` by the start scripts. The pinned version (`0.0.75`) is mirrored in `.local/Dockerfile` so the image bakes in matching browser binaries and `npx -y` does not need to fetch them at runtime.
+`.mcp.json` in the project root is the discovery point — Claude Code picks it up
+automatically. The old sandbox passed `.local/.mcp.json` with `--mcp-config` from a
+start script; there are no start scripts any more, because Claude runs natively rather
+than in a container, so a project-root `.mcp.json` is the right home.
 
-Screenshots default to `/workspace/.local/.playwright-mcp/` (the `--output-dir` flag in `.mcp.json`). `.local/CLAUDE-LOCAL.md` instructs Claude to set `filename` to that same path when calling `browser_take_screenshot`, so screenshots never land in the workspace root. The directory is auto-pruned on each start.
+It points at `.local/playwright-mcp.sh` rather than `@playwright/mcp` directly, which
+is what adds the headed display, the per-project profile and the headless fallback.
+
+One implementation note if you edit that script: **MCP speaks JSON-RPC over stdout**,
+so anything printed there corrupts the stream and the server looks like it is hanging.
+Every diagnostic in it goes to stderr, deliberately.
+
+Screenshots default to `.playwright-mcp/` via `--output-dir`, and that directory is
+pruned on each start.
 
 ## .env Protection
 
-Because `.env` holds your long-lived Anthropic token, it gets layered protection:
+`.env` and `.local/.playwright-secrets` both get layered protection:
 
-- **`.local/CLAUDE-LOCAL.md`** — a hard rule telling Claude to never read or transmit `.env` (or any backup like `.env.bak`, `.env.local`, `.env.testbackup`), loaded via the `@` import in `CLAUDE.md`.
-- **`.claude/settings.json`** — a `permissions.deny` list that blocks the Read tool against `.env` / `**/.env.*`, plus a long set of `Bash(<tool> *.env*)` patterns for `cat`, `grep`, `sed`, `cp`, `mv`, `tar`, `zip`, etc.
-- **`.claude/hooks/deny-env-reads.sh`** and **`deny-env-reads.ps1`** — PreToolUse hooks (one for each interpreter; the missing one no-ops) that inspect every Bash command's full text and deny anything referencing `.env` or `.env.<ext>` other than `.env.example`. Hook failures fail open so a broken hook can't lock you out.
-- **`_hook_tests.sh`** in the same folder is a small developer harness that runs the bash hook against a handful of expected-block / expected-allow inputs.
+- **`.local/CLAUDE-LOCAL.md`** — a hard rule telling Claude never to read or transmit
+  either file (or any backup like `.env.bak`, `.env.local`), loaded via the `@` import
+  in `CLAUDE.md`.
+- **`.claude/settings.json`** — a `permissions.deny` list blocking the Read tool
+  against `.env` / `**/.env.*` / the secrets file, plus a long set of
+  `Bash(<tool> *.env*)` and `Bash(<tool> *playwright-secrets*)` patterns for `cat`,
+  `grep`, `sed`, `cp`, `mv`, `tar`, `zip` and friends. This layer is enforced by Claude
+  Code itself.
+- **`.claude/hooks/deny-env-reads.sh`** (and `.ps1`) — PreToolUse hooks that inspect
+  every Bash command's full text and deny anything referencing `.env`, `.env.<ext>`
+  other than `.env.example`, or the secrets file. Hook failures fail open, so a broken
+  hook cannot lock you out.
+- **`_hook_tests.sh`** — a developer harness running the hook against expected-block
+  and expected-allow inputs.
 
-`.env.example` is always allowed — it contains variable names but no secrets.
+**The hook layer needs `jq`.** `settings.json` only runs the hook when `jq` is present,
+so without it that layer is silently inert and only the deny list is active.
+`bootstrap-vm.sh` installs `jq` for this reason.
 
-## Sessions
-
-Your conversations are stored inside the container's `<project>_claude-config` volume, so they survive a normal restart. But `rebuild-claude.sh` deletes that volume — which would wipe your history. This feature keeps it safe across a rebuild.
-
-- **Back up** — `rebuild-claude.sh` offers to copy your sessions out of the container into `.local/.claude-sessions/` before deleting anything, opens the folder in Explorer, and waits for you to confirm the backup looks right.
-- **Restore** — `restore-sessions.sh` copies `.local/.claude-sessions/` back into the container's volume.
-- **Resume** — Claude's built-in `--resume` may not list a restored session. So `restore-sessions.sh` also copies a ready-made prompt to your Windows clipboard via `clip.exe`: start Claude, paste it in, and Claude reads the old transcript and continues from where you left off.
-
-`.local/.claude-sessions/` is git-ignored — transcripts contain your conversation content.
+`.env.example` is always allowed — it contains variable names but no secrets. Note that
+the deny patterns are broad enough to also block `cat .env.example`; read it with an
+editor or a differently-named copy if you need to.
 
 ## Multiple Projects
 
-The start, rebuild, restore, and `compose.sh` scripts compute a per-project `COMPOSE_PROJECT_NAME` from the parent directory name (`<dirname>-claude`). That means you can clone or copy this whole folder into any number of WordPress projects and each one gets:
+Copy this whole folder into as many WordPress projects as you like. Because
+`.ddev/config.yaml` has no `name:`, each copy names itself from its directory and gets:
 
-- its own `claude`, `wordpress`, and `db` containers,
-- its own `claude-config`, `claude-cache`, and `wp-db` volumes (so each project has an independent DB),
-- its own compose network (`http://wordpress/` from inside that project's Claude container only ever hits that project's WP container),
-- its own session backup at `.local/.claude-sessions/`.
+- its own containers and its own database,
+- its own hostname at `https://<directory-name>.ddev.site`,
+- its own browser profile at `.local/.playwright-profile/`,
+- its own Pantheon site setting in `.ddev/config.local.yaml`.
 
-The Docker image (`claude-dangerous:latest`) is shared across all of them — only volumes and containers are per-project. Note that the published ports are _not_ per-project: `8080` (WordPress) and `8025` (Mailpit) are fixed, so two sandboxes can't run those services at the same time. Mailpit's host port can be moved with `MAILPIT_PORT=<port>`; WordPress's needs an edit to `docker-compose.yml`.
+**They can all run at the same time.** DDEV routes every project through one shared
+router keyed on hostname, so there are no per-project host ports to collide — a real
+change from the old setup, where `8080` and `8025` were fixed and only one sandbox could
+run at once.
 
-**If a port refuses to bind on Windows** with `An attempt was made to access a socket in a way forbidden by its access permissions`, Hyper-V has reserved that range for dynamic use — it commonly swallows 8080 and 8025. Check with `netsh interface ipv4 show excludedportrange protocol=tcp` in an elevated prompt, then either release the ranges (`net stop winnat` && `net start winnat`) or reserve the port for yourself so Hyper-V stops taking it:
+What *is* shared, on purpose: the virtual display, xrdp, Chromium, and the trusted CA.
+Each project's browser is a separate window on the one virtual desktop.
 
-```
-netsh int ipv4 add excludedportrange protocol=tcp startport=8080 numberofports=1 store=persistent
-```
+`ddev list` shows every project; `ddev poweroff` stops all of them.
+
+## What changed from the Docker version
+
+If you know the Compose-based sandbox, here is the short version.
+
+**Deleted, because DDEV already does it:** `Dockerfile`, `Dockerfile.wp-cli`,
+`docker-compose.yml`, `wp-entrypoint.sh`, `php-memory.ini`, `compose.sh`. DDEV provides
+WordPress, MariaDB, WP-CLI, GD, Imagick with full delegates, Mailpit, and host-user file
+ownership. `Dockerfile.wp-cli` existed only to repair `wordpress:cli`'s delegate-less
+Imagick; that bug does not exist in DDEV's container.
+
+**Deleted, because Claude no longer runs in a container:** `start-claude-normal.sh`,
+`start-claude-dangerously.sh`, `rebuild-claude.sh`, `restore-sessions.sh`, the session
+backup/restore dance, the OAuth token in `.env`, and the "Update Claude CLI" menu
+option. Claude runs natively on the VM.
+
+**Deleted, because the underlying problem is gone:**
+
+- `DOC/FIX/PLAYWRIGHT_BLANK_PAGE_FIX.md` — blank pages and hanging screenshots came
+  from headed Chrome painting to an *occludable* X window on the Windows desktop; when
+  Windows stopped driving paints, Chrome produced zero frames. An Xvfb framebuffer is
+  always mapped, so it cannot recur. VcXsrv and the `DISPLAY=host.docker.internal:0.0`
+  wiring are gone with it.
+- `DOC/FIX/WP_CLI_DB_CONNECTION_FIX.md` — the `php -d variables_order=EGPCS` workaround
+  is unnecessary: DDEV's PHP already ships `variables_order=EGPCS`, so `$_ENV` is
+  populated. Just run `ddev wp`.
+
+**Changed:**
+
+- `http://wordpress/` → `https://<project>.ddev.site`. The container hostname existed
+  because Playwright ran in a sibling container on a Compose network.
+- `PANTHEON_ENVIRONMENT=local` → `IS_DDEV_PROJECT=true` as the sandbox-only gate.
+- `wp-config.local.php` → DDEV's own `wp-config-ddev.php`, with `site-control.sh`
+  option 3 wiring your `wp-config.php` to it.
+- Apache → nginx. This matches Pantheon, which also runs nginx. **Consequence: the
+  repository's `.htaccess` is inert**, exactly as it is on Pantheon. Custom rewrite or
+  header rules go in `.ddev/nginx_full/`.
+- The mailpit mu-plugin shrank to a mail *guard* (see
+  [Email capture](#email-capture-mailpit)).
+- Masking `.local` and `.sass` out of the docroot with anonymous volumes is no longer
+  needed — DDEV's nginx denies dotted paths already.
+
+**New:** the Pantheon database pull, `ddev snapshot` for database snapshots, `ddev
+xdebug on` for step debugging, `ddev xhgui` for profiling, `ddev share` for a temporary
+public URL, and the take-over-the-browser workflow.
 
 ## Development
 
-Want to contribute? Great!
-
-Fork it, edit the `Dockerfile`, compose file, or scripts in `.local/`, and send a PR — or just send me a message.
+Want to contribute? Great! Fork it, edit the scripts in `.local/` or the config in
+`.ddev/`, and send a PR — or just send me a message.
 
 ## Disclaimer
 
-This is a personal project. It reduces risk — it does not eliminate it. Use it with a clear understanding of what the container does and does not protect.
+**Read this section if you are coming from the Docker version — the security model has
+changed.**
 
-**Supply-chain risk is real.** Packages from registries like npm, PyPI, and Composer/Packagist do get compromised, through maintainer account takeovers, typosquatting, and malicious updates. An npm `postinstall` script runs arbitrary code the moment a package is installed — before the project is ever run. WordPress plugins and themes pulled from arbitrary sources are no safer. The Problem section is not an exaggeration.
+The old sandbox ran Claude with `--dangerously-skip-permissions` *inside a container*,
+and the pitch was that malicious code could only reach the container and the project
+folder mounted into it. **That is no longer how this works.** Claude now runs natively
+on the machine hosting DDEV, with that user's full access: every repository in your home
+directory, your SSH keys, your shell history, `~/.ddev/global_config.yaml` and any API
+tokens in it.
 
-**A container reduces the blast radius — it does not "prevent" everything.** Phrases in this README like "walled off" and "an exploit cannot reach my system" describe the goal, not an absolute guarantee.
+So the boundary has moved outward, and it is now **the machine itself**. That is a
+perfectly good boundary — if that machine is a VM you are willing to lose. It is a bad
+one if it is your daily driver.
 
-What the container protects:
+**Run this on a dedicated VM or a disposable machine.** Not on the laptop holding your
+personal files.
 
-- Malicious code cannot see or touch the rest of your machine — other folders, other projects, your Windows user profile, SSH keys, saved browser passwords. It only sees the container.
-- On Windows, Docker Desktop runs the container inside a WSL2 virtual machine, so there is a VM boundary as well, not just a container boundary.
-- The container is disposable. `rebuild-claude.sh` destroys and recreates it.
+What still holds:
 
-What the container does not protect:
+- **The VM boundary is real.** On a Hyper-V or similar VM, a compromise is confined to
+  that VM and does not reach the host's files.
+- **The environment is disposable.** `ddev delete` and a fresh clone rebuild everything.
 
-- **The mounted project folder is fully exposed.** The project directory is bind-mounted into the container with read and write access. Malicious code can read, change, encrypt, or steal anything in the project you mount — including your WordPress files, themes, plugins, and any uploaded media in `wp-content/uploads/`. The container protects everything except the folder you point it at.
-- **The sandbox database is reachable from the Claude container.** `db` is on the compose network with default sandbox credentials. Anything running in the `claude` container can read or wipe the WP database. Don't put real production data in it without thinking about that.
-- **Outbound internet is open.** Malicious code can send data to a remote server. The container does not firewall outbound traffic, and Claude, wp-cli, WordPress, and Playwright all need internet to function.
-- **Your Anthropic token is reachable.** `CLAUDE_CODE_OAUTH_TOKEN` lives in the container environment, and `.env` sits in the mounted project folder. The `.env` protections above stop _Claude_ from reading it, but any other process the container ends up running can still see it. To eliminate that, remove the token from `.env` and log in interactively instead.
-- **Container escape is possible.** It is rare, but a container is not as strong a security boundary as a full virtual machine.
+What you are accepting:
 
-The accurate mental model: anything that goes wrong is confined to the container, the project folder mounted into it, and the sandbox database — and kept away from the rest of your system. That is a large and worthwhile reduction in risk — but the project folder, the sandbox DB, and the injected token are inside the blast zone, and nothing here is a guarantee. Use it at your own risk.
+- **Supply-chain risk is real.** Packages from npm, PyPI and Packagist do get
+  compromised through account takeovers, typosquatting and malicious updates. An npm
+  `postinstall` script runs arbitrary code the moment a package is installed — before
+  the project is ever run. WordPress plugins and themes from arbitrary sources are no
+  safer.
+- **The whole VM is in the blast radius**, not just one project folder. Anything on it
+  can be read, changed, encrypted or exfiltrated.
+- **Outbound internet is open.** Nothing here firewalls it, and Claude, WP-CLI,
+  WordPress, Composer and Playwright all need it.
+- **Secrets on the VM are reachable.** The `.env` and `.playwright-secrets` protections
+  stop *Claude* from reading those files; they do not stop any other process the VM ends
+  up running. A Pantheon machine token in `~/.ddev/global_config.yaml` is plaintext and
+  is injected into every project's web container.
+- **`ddev share` exposes the site publicly** while it runs. Be deliberate about it.
+
+The accurate mental model: anything that goes wrong is confined to this VM and the
+credentials reachable from it, and kept away from the host. That is a large and
+worthwhile reduction in risk — and it is a smaller reduction than the container version
+claimed. Use it at your own risk.
 
 ## License
 

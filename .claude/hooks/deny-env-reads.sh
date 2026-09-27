@@ -19,15 +19,17 @@ if [ -z "$raw" ]; then exit 0; fi
 cmd=$(printf '%s' "$raw" | jq -r '.tool_input.command // ""' 2>/dev/null)
 if [ -z "$cmd" ]; then exit 0; fi
 
-# Match .env.<ext> first (greedy), then bare .env at a word boundary.
+# Match .env.<ext> first (greedy), then bare .env at a word boundary, then the
+# Playwright secrets file (credentials the browser may use but Claude may not
+# read - see .local/playwright-mcp.sh --secrets).
 # Filter out .env.example - the only .env variant safe to read.
 hits=$(printf '%s' "$cmd" \
-    | grep -oP '\.env\.[A-Za-z0-9_-]+|\.env(?=\W|$)' 2>/dev/null \
+    | grep -oP '\.env\.[A-Za-z0-9_-]+|\.env(?=\W|$)|\.playwright-secrets' 2>/dev/null \
     | grep -vx '\.env\.example' 2>/dev/null)
 
 if [ -n "$hits" ]; then
     joined=$(printf '%s' "$hits" | paste -sd, - | sed 's/,/, /g')
-    reason="Refused. Bash command references: ${joined}. CLAUDE.md prohibits reading or copying the .env file via shell commands (this also blocks cp/mv to .env.* backups, which are exfiltration vectors). Use Edit/Write tools if you genuinely need to modify .env."
+    reason="Refused. Bash command references: ${joined}. CLAUDE.md prohibits reading or copying the .env file or .local/.playwright-secrets via shell commands (this also blocks cp/mv to .env.* backups, which are exfiltration vectors). Use Edit/Write tools if you genuinely need to modify .env."
     # jq handles JSON escaping of the reason string.
     printf '%s' "$reason" | jq -Rsc \
         '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",permissionDecisionReason:.}}'

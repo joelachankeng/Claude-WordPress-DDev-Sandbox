@@ -1,0 +1,9 @@
+{
+  "//": "Project-scoped MCP servers, auto-discovered from the project root. The old sandbox passed .local/.mcp.json to Claude with --mcp-config from a start script; Claude now runs natively on the VM and there are no start scripts, so this file is the discovery point instead. The launcher adds a headed browser on the shared virtual display, a per-project profile directory, and a headless fallback — see .local/playwright-mcp.sh.",
+  "mcpServers": {
+    "playwright": {
+      "command": "bash",
+      "args": [".local/playwright-mcp.sh"]
+    }
+  }
+}

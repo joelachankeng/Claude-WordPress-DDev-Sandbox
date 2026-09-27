@@ -272,17 +272,54 @@ fi
 
 VM_IP="$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR==1{sub(/\/.*/,"",$4); print $4}')"
 
-cat <<EOF
+# How xrdp is reachable depends entirely on its [Globals] port setting, and the
+# Debian default on a Hyper-V guest is NOT a TCP port:
+#
+#   port=vsock://-1:3389
+#
+# That is a Hyper-V VSOCK, used by Enhanced Session Mode — you connect through
+# Hyper-V Manager / vmconnect, and nothing is listening on TCP 3389 at all.
+# `ss -ltn` shows nothing for it either (you need `ss --vsock -l`), which makes it
+# easy to conclude xrdp is broken when it is working perfectly. So report the
+# truth for this machine rather than assuming.
+XRDP_PORT_LINE="$(sed -n 's/^[[:space:]]*port=\(.*\)$/\1/p' /etc/xrdp/xrdp.ini 2>/dev/null | head -1)"
 
-================================================================
- Bootstrap complete.
-================================================================
+echo
+echo "================================================================"
+echo " Bootstrap complete."
+echo "================================================================"
+echo
+echo " Connect to the browser"
+echo " ----------------------"
+case "$XRDP_PORT_LINE" in
+  vsock*)
+    cat <<EOF
+   This xrdp listens on a Hyper-V VSOCK (${XRDP_PORT_LINE}), not a TCP port —
+   that is Enhanced Session Mode, and it is the Debian default on a Hyper-V guest.
 
- Connect to the browser from Windows
- -----------------------------------
+   So connect through **Hyper-V Manager -> Connect** (vmconnect), NOT to an IP
+   address. Nothing is listening on TCP 3389, and \`ss -ltn\` will show nothing
+   for xrdp; use \`ss --vsock -l\` to see the real listener.
+
+   If you would rather reach it with a normal RDP client over the network, set
+   this in the [Globals] section of /etc/xrdp/xrdp.ini:
+
+       port=3389
+
+   then \`sudo systemctl restart xrdp\` (while NOT connected — see below) and
+   connect to ${VM_IP:-<this-vm-ip>}:3389 or $(hostname).mshome.net:3389.
+EOF
+    ;;
+  *)
+    cat <<EOF
    Open Remote Desktop Connection and connect to:
 
        ${VM_IP:-<this-vm-ip>}:3389      (or: $(hostname).mshome.net:3389)
+EOF
+    ;;
+esac
+
+cat <<EOF
 
    Choose the "Sandbox Browser" session when xrdp asks. You will see the
    virtual desktop holding the browser windows. Anything you do there — logging

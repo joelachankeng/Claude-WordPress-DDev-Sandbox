@@ -360,8 +360,23 @@ It runs **headed** on a shared virtual display, so you can watch it and take ove
 
 ### Taking over the browser
 
-1. Connect an RDP client to the VM on port `3389` and choose the **"Sandbox Browser"**
-   session.
+1. Connect with an RDP client and choose the **"Sandbox Browser"** session.
+
+   *How* you connect depends on how xrdp is configured, and the Debian default on a
+   Hyper-V guest is not what you would guess. Check it:
+
+   ```bash
+   grep -m1 '^port=' /etc/xrdp/xrdp.ini
+   ```
+
+   - `port=vsock://-1:3389` — Hyper-V **Enhanced Session Mode**. Connect through
+     **Hyper-V Manager → Connect** (vmconnect), *not* to an IP address. Nothing
+     listens on TCP 3389, and `ss -ltn` shows nothing for xrdp — which makes it very
+     easy to conclude xrdp is broken when it is fine. Use `ss --vsock -l` to see the
+     real listener. `bootstrap-vm.sh` detects this and prints the right advice.
+   - `port=3389` — an ordinary TCP listener. Connect to
+     `<vm-ip>:3389` or `<hostname>.mshome.net:3389`.
+
 2. You are looking at the virtual desktop the browser lives on. Log in, solve the
    captcha, type the password.
 3. Disconnect. **The browser stays running** and automation continues with your
@@ -748,6 +763,11 @@ to the local console session.
 
 `bootstrap-vm.sh` will no longer restart `xrdp` when it detects a live session, for
 exactly this reason; it tells you to do it from SSH or after disconnecting instead.
+
+**A red herring while diagnosing this:** `ss -ltn | grep 3389` showing nothing does
+*not* mean xrdp is down. On a Hyper-V guest the Debian default is
+`port=vsock://-1:3389`, a VSOCK that `ss -ltn` cannot display. Check with
+`ss --vsock -l`, which should show `v_str LISTEN *:3389`.
 
 ### The desktop's window manager changed after running bootstrap
 

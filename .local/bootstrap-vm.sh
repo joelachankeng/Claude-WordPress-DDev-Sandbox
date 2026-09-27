@@ -70,6 +70,19 @@ for p in "${PACKAGES[@]}"; do
   dpkg -l "$p" 2>/dev/null | grep -q '^ii' || MISSING+=("$p")
 done
 
+# Remember the system window manager before installing anything. Debian's
+# alternatives system picks the highest-priority candidate while the link is in
+# "auto" mode, and OPENBOX REGISTERS AT PRIORITY 90 against xfwm4's 60 — so
+# installing openbox silently makes it the system window manager for every
+# desktop session on the machine. That is not what we want: openbox is here only
+# to manage windows on the headless :99 display, and display.sh invokes it by
+# name, so the alternative is irrelevant to us. Captured here, restored below.
+WM_BEFORE=""
+if command -v update-alternatives >/dev/null 2>&1; then
+  WM_BEFORE="$(update-alternatives --query x-window-manager 2>/dev/null \
+                | sed -n 's/^Value: //p' | head -1)"
+fi
+
 if (( ${#MISSING[@]} == 0 )); then
   ok "all present: ${PACKAGES[*]}"
 else
@@ -81,6 +94,24 @@ else
   else
     fail "cannot continue without root for apt"
     exit 1
+  fi
+fi
+
+# Put the system window manager back if openbox took it. --set also switches the
+# link to manual mode, so a future openbox upgrade cannot quietly reclaim it.
+if [[ -n "$WM_BEFORE" ]]; then
+  WM_NOW="$(update-alternatives --query x-window-manager 2>/dev/null | sed -n 's/^Value: //p' | head -1)"
+  if [[ "$WM_NOW" != "$WM_BEFORE" ]]; then
+    info "installing openbox changed the system window manager:"
+    info "  $WM_BEFORE -> $WM_NOW"
+    if need_sudo && sudo update-alternatives --set x-window-manager "$WM_BEFORE" >/dev/null 2>&1; then
+      ok "restored the system window manager to $WM_BEFORE (pinned)"
+    else
+      warn "could not restore it. Do this by hand or your desktop session will"
+      warn "use openbox: sudo update-alternatives --set x-window-manager $WM_BEFORE"
+    fi
+  else
+    ok "system window manager unchanged ($WM_NOW)"
   fi
 fi
 
@@ -193,7 +224,32 @@ ip=127.0.0.1
 port=${VNC_PORT}
 EOF
     ok "added the [${SECTION}] session to $XRDP_INI"
-    sudo systemctl restart xrdp && ok "restarted xrdp"
+
+    # Restarting xrdp kills every live RDP session, and — worse — ORPHANS the X
+    # server, xfce4-session and xrdp-chansrv belonging to it (their parent
+    # xrdp-sesman dies, so they reparent to init and keep holding the display).
+    # A stale xfce4-session then refuses to let the same user start a new one, so
+    # every subsequent RDP login connects and immediately disconnects. If you are
+    # reading this because that happened: see "RDP logins disconnect immediately"
+    # in the README.
+    #
+    # So: never restart xrdp out from under a live session. Say what is needed
+    # and let the user do it from SSH or after disconnecting.
+    if pgrep -f 'Xorg.*xrdp/xorg.conf' >/dev/null 2>&1 || pgrep -x xrdp-chansrv >/dev/null 2>&1; then
+      warn "an RDP session is active right now — NOT restarting xrdp."
+      info "You are most likely connected through it. Restarting would disconnect"
+      info "you and orphan the session, which breaks later logins."
+      info ""
+      info "Finish this script, then either:"
+      info "  * disconnect your RDP session and run: sudo systemctl restart xrdp"
+      info "  * or run that over SSH instead"
+      info ""
+      info "The [${SECTION}] session only appears after that restart."
+    elif sudo systemctl restart xrdp; then
+      ok "restarted xrdp"
+    else
+      warn "could not restart xrdp — run 'sudo systemctl restart xrdp' yourself"
+    fi
   else
     warn "skipped — no root"
   fi

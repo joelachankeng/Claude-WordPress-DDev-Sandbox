@@ -47,7 +47,7 @@ mkdir -p "$LOG_DIR"
 # X marks a display as taken with a lock file, so this is the authoritative check
 # rather than pgrep (which would also match a dying process).
 xvfb_running()   { [[ -e "/tmp/.X${DISPLAY_NUM}-lock" ]] && pgrep -f "Xvfb ${DISPLAY_NAME}" >/dev/null 2>&1; }
-openbox_running(){ pgrep -f "openbox.*--config-file ${RUN_DIR}/openbox-rc.xml" >/dev/null 2>&1; }
+openbox_running(){ pgrep -f "openbox.*${RUN_DIR}/openbox-rc.xml" >/dev/null 2>&1; }
 x11vnc_running() { pgrep -f "x11vnc.*-rfbport ${VNC_PORT}" >/dev/null 2>&1; }
 
 need() {
@@ -92,7 +92,9 @@ start_up() {
   else
     echo "Starting Xvfb on $DISPLAY_NAME ($SCREEN_GEOMETRY)..."
     # -nolisten tcp: the display is reached through x11vnc, never raw X over TCP.
-    nohup Xvfb "$DISPLAY_NAME" -screen 0 "$SCREEN_GEOMETRY" -nolisten tcp \
+    # setsid for the same reason as openbox below: the display must outlive the
+    # shell (and the desktop session) that started it.
+    nohup setsid Xvfb "$DISPLAY_NAME" -screen 0 "$SCREEN_GEOMETRY" -nolisten tcp \
       >"$LOG_DIR/xvfb.log" 2>&1 &
     # Wait for the display to actually accept connections before starting
     # anything that needs it; a race here shows up as openbox exiting instantly.
@@ -112,7 +114,18 @@ start_up() {
     (( quiet )) || echo "openbox already running"
   else
     echo "Starting openbox..."
-    DISPLAY="$DISPLAY_NAME" nohup openbox --config-file "$RUN_DIR/openbox-rc.xml" \
+    # --sm-disable, and SESSION_MANAGER / DBUS_SESSION_BUS_ADDRESS cleared, are
+    # all load-bearing. If this script is run from inside a desktop session — an
+    # RDP session, most likely — openbox inherits SESSION_MANAGER, registers with
+    # THAT session's manager over ICE, and dies the moment the session ends:
+    #
+    #   ICE default IO error handler doing an exit(), pid = ..., errno = 11
+    #
+    # The window manager for the persistent display must outlive whatever shell
+    # started it, so it must not join anyone else's session.
+    env -u SESSION_MANAGER -u DBUS_SESSION_BUS_ADDRESS -u XDG_SESSION_ID \
+      DISPLAY="$DISPLAY_NAME" \
+      nohup setsid openbox --sm-disable --config-file "$RUN_DIR/openbox-rc.xml" \
       >"$LOG_DIR/openbox.log" 2>&1 &
     sleep 0.5
   fi
@@ -126,7 +139,7 @@ start_up() {
     # -forever / -shared: survive a disconnect and allow reconnecting, which is
     #   the entire point of a persistent display.
     # -nopw is safe only in combination with -localhost.
-    nohup x11vnc -display "$DISPLAY_NAME" -rfbport "$VNC_PORT" \
+    nohup setsid x11vnc -display "$DISPLAY_NAME" -rfbport "$VNC_PORT" \
       -localhost -forever -shared -nopw -quiet \
       >"$LOG_DIR/x11vnc.log" 2>&1 &
     sleep 0.5
@@ -148,7 +161,7 @@ start_up() {
 start_down() {
   local stopped=0
   if x11vnc_running; then pkill -f "x11vnc.*-rfbport ${VNC_PORT}" && { echo "Stopped x11vnc"; stopped=1; }; fi
-  if openbox_running; then pkill -f "openbox.*--config-file ${RUN_DIR}/openbox-rc.xml" && { echo "Stopped openbox"; stopped=1; }; fi
+  if openbox_running; then pkill -f "openbox.*${RUN_DIR}/openbox-rc.xml" && { echo "Stopped openbox"; stopped=1; }; fi
   if xvfb_running; then
     pkill -f "Xvfb ${DISPLAY_NAME}" && { echo "Stopped Xvfb"; stopped=1; }
     # Xvfb does not always clean this up when killed, and a stale lock makes the

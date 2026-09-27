@@ -47,6 +47,7 @@ from a Pantheon environment with one menu option.
 - [.env Protection](#env-protection)
 - [Multiple Projects](#multiple-projects)
 - [What changed from the Docker version](#what-changed-from-the-docker-version)
+- [Troubleshooting](#troubleshooting)
 - [Development](#development)
 - [Disclaimer](#disclaimer)
 - [License](#license)
@@ -708,6 +709,78 @@ option. Claude runs natively on the VM.
 **New:** the Pantheon database pull, `ddev snapshot` for database snapshots, `ddev
 xdebug on` for step debugging, `ddev xhgui` for profiling, `ddev share` for a temporary
 public URL, and the take-over-the-browser workflow.
+
+## Troubleshooting
+
+### RDP logins disconnect immediately
+
+You connect, it authenticates, and the session closes at once — repeatedly. Almost
+always this means a **previous RDP session was orphaned** and is still holding the
+display.
+
+It happens when `xrdp` is restarted while a session is live. The session's `Xorg`,
+`xfce4-session` and `xrdp-chansrv` lose their parent `xrdp-sesman`, reparent to
+`init` (PPID 1) and keep running. A stale `xfce4-session` then refuses to let the
+same user start a second one, so every new login dies instantly. `~/.xsession-errors`
+shows the giveaway — a session starting over and over:
+
+```
+Xsession: X session started for <user> at ...
+/usr/bin/x-session-manager: X server already running on display :11.0
+```
+
+Find the orphans — the tell is `PPID 1` on an `Xorg` started with `xrdp/xorg.conf`:
+
+```bash
+ps -eo pid,ppid,user,cmd | grep -E "[X]org.*xrdp|[x]fce4-session|[x]rdp-chansrv"
+```
+
+Kill them (they are yours, so no `sudo` needed), then clear any stale lock left
+behind, then reconnect:
+
+```bash
+kill <xfce4-session-pid> <xrdp-chansrv-pid> <Xorg-pid>
+rm -f /tmp/.X<N>-lock /tmp/.X11-unix/X<N>      # only for the dead display
+```
+
+Be careful to leave `:99` alone — that is the sandbox's own display, and `:0` belongs
+to the local console session.
+
+`bootstrap-vm.sh` will no longer restart `xrdp` when it detects a live session, for
+exactly this reason; it tells you to do it from SSH or after disconnecting instead.
+
+### The desktop's window manager changed after running bootstrap
+
+Installing `openbox` can silently replace the system window manager. Debian's
+alternatives system picks the highest-priority candidate while the link is in `auto`
+mode, and **openbox registers at priority 90 against xfwm4's 60** — so a machine
+running XFCE quietly switches to openbox for every desktop session.
+
+`bootstrap-vm.sh` now records the window manager before installing and puts it back
+afterwards. To check and fix it by hand:
+
+```bash
+update-alternatives --query x-window-manager | grep -E "^(Value|Best|Status)"
+sudo update-alternatives --set x-window-manager /usr/bin/xfwm4
+```
+
+`--set` also switches the link to manual mode, so a later openbox upgrade cannot
+reclaim it. This does not affect the sandbox: `display.sh` runs openbox by name on
+the `:99` display and never consults the alternative.
+
+### The headed browser's window manager keeps dying
+
+If `display.sh status` shows openbox stopped and its log ends with:
+
+```
+ICE default IO error handler doing an exit(), pid = ..., errno = 11
+```
+
+then openbox joined somebody else's desktop session and died with it. That happens
+when it inherits `SESSION_MANAGER` from the shell that started it — typically because
+`display.sh up` was run from inside an RDP session. It is launched with
+`--sm-disable` and a cleared `SESSION_MANAGER` to prevent this; if you edit that
+launch line, keep both.
 
 ## Development
 

@@ -17,6 +17,27 @@ set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
+# Do NOT run this whole script with sudo. It calls sudo itself for the few steps
+# that need root, and deliberately does the rest as you: Playwright's browsers go
+# to ~/.cache/ms-playwright and the certificate goes into ~/.pki/nssdb. Run as
+# root and both land in /root, where your own browser will never look for them —
+# so Chromium would still fail with ERR_CERT_AUTHORITY_INVALID and Playwright
+# would report a missing browser, with nothing obviously wrong.
+if [[ "${EUID}" -eq 0 ]]; then
+  cat >&2 <<'ROOTMSG'
+[bootstrap-vm.sh] Do not run this with sudo.
+
+  Run it as your normal user:
+
+      ./.local/bootstrap-vm.sh
+
+  It will ask for your sudo password only for the steps that genuinely need root
+  (installing packages, configuring xrdp). The other steps must run as you, or
+  the browser and the certificate end up in /root and your user cannot use them.
+ROOTMSG
+  exit 1
+fi
+
 STEP=0
 step() { STEP=$((STEP + 1)); printf '\n\033[1m[%d] %s\033[0m\n' "$STEP" "$*"; }
 ok()   { printf '    \033[32mOK\033[0m  %s\n' "$*"; }

@@ -727,6 +727,33 @@ public URL, and the take-over-the-browser workflow.
 
 ## Troubleshooting
 
+### "Error establishing a database connection" on a Pantheon project
+
+The usual cause is not DDEV. It is the dead-code fallback at the end of the
+stock Pantheon `wp-config.php`:
+
+```php
+} else {
+    define('DB_NAME',          'database_name');
+    ...
+```
+
+On Pantheon that branch never runs, because `PANTHEON_ENVIRONMENT` is always
+set. Under DDEV nothing sets it and `wp-config-local.php` does not exist, so the
+branch *does* run — and it runs above the `wp-config-ddev.php` include, because
+that include has to sit after `ABSPATH` is defined (`wp-config-ddev.php`
+dereferences `ABSPATH` to compute `WP_SITEURL`; put it any higher and you get an
+instant fatal). Since DDEV guards every constant with `defined() || define()`,
+the placeholders win. Confirm it with:
+
+```
+ddev exec php -r 'require "wp-config.php";' 2>/dev/null; ddev wp config get DB_NAME
+```
+
+`database_name` means you have hit this. **`.local/site-control.sh` option 3
+detects and fixes it** — it retargets that one `else` to skip under DDEV, which
+leaves Pantheon and plain local checkouts behaving exactly as before.
+
 ### RDP logins disconnect immediately
 
 You connect, it authenticates, and the session closes at once — repeatedly. Almost

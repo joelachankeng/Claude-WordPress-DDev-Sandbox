@@ -182,6 +182,103 @@ if (getenv('IS_DDEV_PROJECT') === 'true' && is_readable($ddev_settings)) {
 SNIPPET
 }
 
+# The stock Pantheon WordPress upstream ends its config cascade with a dead-code
+# fallback that hardcodes placeholder credentials:
+#
+#     } else {
+#         define('DB_NAME', 'database_name');
+#         ...
+#
+# On Pantheon that branch never runs, because PANTHEON_ENVIRONMENT is always set.
+# Under DDEV nothing sets it, wp-config-local.php does not exist, so the fallback
+# DOES run -- and it runs *above* our include, because the include has to sit
+# after ABSPATH is defined (wp-config-ddev.php dereferences ABSPATH when it
+# computes WP_SITEURL, so inserting it any higher is an instant fatal).
+#
+# wp-config-ddev.php guards every constant with defined() || define(), so the
+# placeholders win and the site reports "Error establishing a database
+# connection" with DB_NAME literally set to the string "database_name".
+#
+# Retargeting that one `else` to skip under DDEV fixes it. This only ever fires
+# when the value is the upstream's placeholder literal, which is never a real
+# credential, and behaviour off DDEV is unchanged.
+PLACEHOLDER_DB_DEFINE="define('DB_NAME',          'database_name');"
+PLACEHOLDER_FALLBACK_MARKER="// DDEV: skip the placeholder fallback"
+neutralize_placeholder_db_defines() {
+  # Already retargeted on a previous run. Checked before the placeholder test,
+  # because the defines themselves stay in the file — only the branch guarding
+  # them changes — so the placeholder is still there afterwards.
+  if grep -qF "$PLACEHOLDER_FALLBACK_MARKER" "$WP_CONFIG" 2>/dev/null; then
+    echo "The placeholder fallback is already retargeted to skip under DDEV."
+    return 0
+  fi
+  grep -qF "$PLACEHOLDER_DB_DEFINE" "$WP_CONFIG" 2>/dev/null || return 0
+
+  echo
+  echo "wp-config.php still contains the Pantheon upstream's placeholder fallback:"
+  echo "    $PLACEHOLDER_DB_DEFINE"
+  echo "Off Pantheon that branch runs, and because it runs before the include"
+  echo "above, its placeholders win over DDEV's real credentials and the site"
+  echo "cannot reach the database."
+  echo
+  echo "Fix: make that one 'else' skip itself under DDEV. Everywhere else -- on"
+  echo "Pantheon, or a plain local checkout -- it behaves exactly as it does now."
+  if ! confirm "Retarget the fallback branch?" Y; then
+    echo "Cancelled. Expect 'Error establishing a database connection' until you"
+    echo "comment out those placeholder define() calls yourself."
+    return 0
+  fi
+
+  local backup tmp
+  backup="$WP_CONFIG.bak.$(date +%Y%m%d%H%M%S)"
+  cp "$WP_CONFIG" "$backup" || { echo "[ERROR] Could not back up wp-config.php."; return 1; }
+  tmp="$(mktemp)" || return 1
+
+  # Rewrite the LAST bare `} else {` that appears above the placeholder define,
+  # so a project with unrelated else-blocks earlier in the file is untouched.
+  awk -v target="$PLACEHOLDER_DB_DEFINE" '
+    { line[NR] = $0 }
+    index($0, target) && !stop { stop = NR }
+    END {
+      hit = 0
+      for (i = stop; i > 0; i--) {
+        if (line[i] ~ /^[ \t]*\}[ \t]*else[ \t]*\{[ \t]*$/) { hit = i; break }
+      }
+      for (i = 1; i <= NR; i++) {
+        if (i == hit) {
+          sub(/\}[ \t]*else[ \t]*\{/,
+              "} elseif (getenv(\047IS_DDEV_PROJECT\047) !== \047true\047) { // DDEV: skip the placeholder fallback",
+              line[i])
+        }
+        print line[i]
+      }
+      if (!hit) exit 3
+    }
+  ' "$WP_CONFIG" > "$tmp"
+  local rc=$?
+
+  if [[ $rc -eq 3 ]]; then
+    echo "[ERROR] Found the placeholder defines but no plain '} else {' above them."
+    echo "        Leaving wp-config.php untouched — comment the defines out by hand."
+    rm -f "$tmp"
+    return 1
+  elif [[ $rc -ne 0 ]]; then
+    echo "[ERROR] Failed to rewrite wp-config.php."
+    rm -f "$tmp"
+    return 1
+  fi
+
+  if ! php -l "$tmp" >/dev/null 2>&1 && ! ddev exec php -l /dev/stdin <"$tmp" >/dev/null 2>&1; then
+    echo "[ERROR] The rewritten wp-config.php does not parse. Leaving it untouched."
+    rm -f "$tmp"
+    return 1
+  fi
+
+  cat "$tmp" > "$WP_CONFIG"
+  rm -f "$tmp"
+  echo "Retargeted the fallback branch. Backup: $(basename "$backup")"
+}
+
 generate_wp_config() {
   ensure_configured || return 1
 
@@ -234,7 +331,10 @@ generate_wp_config() {
   fi
 
   if grep -q 'wp-config-ddev\.php' "$WP_CONFIG" 2>/dev/null; then
-    echo "wp-config.php is yours and already includes wp-config-ddev.php. Nothing to do."
+    echo "wp-config.php is yours and already includes wp-config-ddev.php."
+    # Still worth checking: the include alone is not enough if a placeholder
+    # fallback defines the DB constants ahead of it.
+    neutralize_placeholder_db_defines || return 1
     return 0
   fi
 
@@ -289,10 +389,13 @@ generate_wp_config() {
   cat "$tmp" > "$WP_CONFIG"
   rm -f "$snippet_file" "$tmp"
   echo "Inserted the include into wp-config.php."
+
+  neutralize_placeholder_db_defines || return 1
+
   echo
-  echo "If wp-config.php also hardcodes DB_NAME / DB_USER / DB_PASSWORD / DB_HOST,"
-  echo "comment those out — whichever is defined first wins, and DDEV's copy uses"
-  echo "defined() guards so it will not override them."
+  echo "If wp-config.php hardcodes DB_NAME / DB_USER / DB_PASSWORD / DB_HOST"
+  echo "anywhere else, comment those out — whichever is defined first wins, and"
+  echo "DDEV's copy uses defined() guards so it will not override them."
 }
 
 # -------------------- 4: import a SQL dump --------------------

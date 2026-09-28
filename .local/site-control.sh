@@ -614,7 +614,33 @@ EOF
 
   # Everything terminus-related runs inside the web container, where terminus and
   # the machine token both live.
-  if ! ddev exec bash -c '
+  #
+  # The body goes to a FILE rather than `ddev exec bash -c '...' -- a b c`.
+  # `ddev exec` does not execve() its argv: it joins every argument into one
+  # string and hands that to a shell in the container. So `-- a b c` arrive as
+  # trailing words on a command line, never as bash's positional parameters,
+  # `$1` is unset, and `set -u` kills the script on its first line. That made
+  # pull-db fail every time. Verified: `ddev exec bash -c 'echo $#' -- foo bar`
+  # prints 0.
+  #
+  # The same flattening means arguments are re-parsed by a shell, so a value
+  # containing a space, ';' or '$' would be split or expanded -- and site/env
+  # come from --site/--env. Hence the character check below rather than trusting
+  # quoting that does not survive the round trip.
+  local bad=""
+  [[ "$site"     =~ ^[A-Za-z0-9._-]+$ ]] || bad="site name '$site'"
+  [[ "$env_name" =~ ^[A-Za-z0-9._-]+$ ]] || bad="environment name '$env_name'"
+  if [[ -n "$bad" ]]; then
+    echo "[ERROR] Refusing to use $bad." >&2
+    echo "        Pantheon site and environment names are letters, digits, '.', '_' and '-'." >&2
+    return 1
+  fi
+
+  local runner_rel=".ddev/.downloads/pull-db-runner.sh"
+  local runner_abs="$PROJECT_ROOT/$runner_rel"
+  # .ddev/.downloads is already git-ignored by DDEV, so the file never shows up
+  # in a target project's `git status`.
+  cat > "$runner_abs" <<'RUNNER' || return 1
     set -euo pipefail
     site="$1"; env_name="$2"; max_age="$3"; dest="$4"
     target="${site}.${env_name}"
@@ -632,10 +658,15 @@ EOF
 
     latest_epoch=""
     if [ -n "${latest}" ]; then
-      if printf "%s" "${latest}" | grep -qE "^[0-9]+$"; then
-        latest_epoch="${latest}"
+      # Terminus 4.x emits a FRACTIONAL epoch, e.g. 1788970695.219365. A bare
+      # ^[0-9]+$ test rejects that, the date -d fallback cannot parse it either,
+      # and the empty result meant "no usable backup" -- so a brand new backup
+      # was created on every run, which on a large site costs minutes. The
+      # fraction is also a fatal arithmetic error in the age calculation below.
+      if printf "%s" "${latest}" | grep -qE "^[0-9]+(\.[0-9]+)?$"; then
+        latest_epoch="${latest%%.*}"
       else
-        # Some terminus versions format the date instead of emitting an epoch.
+        # Older terminus versions format the date instead of emitting an epoch.
         latest_epoch="$(date -d "${latest}" +%s 2>/dev/null || true)"
       fi
     fi
@@ -662,7 +693,17 @@ EOF
     rm -f "${dest}"
     terminus backup:get "${target}" --element=database --to="${dest}"
     ls -lh "${dest}"
-  ' -- "$site" "$env_name" "$PANTHEON_BACKUP_MAX_AGE_SECONDS" "/var/www/html/$PANTHEON_DUMP_REL" </dev/null; then
+RUNNER
+
+  # TERMINUS_MACHINE_TOKEN is read from the container's environment inside the
+  # runner, so the token is never written to this file or echoed here.
+  local pull_rc=0
+  ddev exec bash "/var/www/html/$runner_rel" \
+    "$site" "$env_name" "$PANTHEON_BACKUP_MAX_AGE_SECONDS" \
+    "/var/www/html/$PANTHEON_DUMP_REL" </dev/null || pull_rc=$?
+  rm -f "$runner_abs"
+
+  if (( pull_rc != 0 )); then
     echo "[ERROR] Pantheon download failed — the local database is untouched."
     return 1
   fi
@@ -744,7 +785,29 @@ search_replace_urls() {
     old_url="$OPT_OLD_URL"
     echo "Old URL (from --old): $old_url"
   else
-    old_url=$(wp_cli option get siteurl 2>/dev/null | tr -d '\r')
+    # Read wp_options directly. NOT `wp option get siteurl`: that returns
+    # get_option('siteurl'), which core filters through _config_wp_siteurl
+    # (registered in wp-includes/default-filters.php), and that callback returns
+    # the WP_SITEURL constant whenever it is defined. wp-config-ddev.php defines
+    # it -- that is the whole point of the wp-config command -- so WP-CLI always
+    # echoed back the DDEV URL. old and new were then equal by construction and
+    # this action reported "nothing to do" while leaving every production URL in
+    # the database untouched. --skip-plugins/--skip-themes does not help; these
+    # are core filters. Checking 'home' instead does not help either; option_home
+    # is filtered the same way.
+    local table_prefix
+    table_prefix="$(wp_cli config get table_prefix 2>/dev/null | tr -d '\r')"
+    # Not every project uses wp_, so ask wp-config.php rather than assuming.
+    [[ "$table_prefix" =~ ^[A-Za-z0-9_]+$ ]] || table_prefix="wp_"
+    old_url=$(db_query "SELECT option_value FROM ${table_prefix}options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null | tr -d '\r')
+
+    local constant_url
+    constant_url=$(wp_cli option get siteurl 2>/dev/null | tr -d '\r')
+    if [[ -n "$old_url" && -n "$constant_url" && "$old_url" != "$constant_url" ]]; then
+      echo "Stored site URL: $old_url"
+      echo "  (WP-CLI reports $constant_url, because wp-config-ddev.php defines WP_SITEURL.)"
+    fi
+
     if [[ -z "$old_url" ]]; then
       echo "Couldn't read the current site URL from the database."
       if ! can_prompt; then

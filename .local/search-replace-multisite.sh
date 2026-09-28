@@ -105,9 +105,19 @@ bare_host() { printf '%s' "$1" | sed -E 's#^[a-zA-Z][a-zA-Z0-9+.-]*://##; s#/+$#
 # multisite bootstrap can't resolve the sandbox host yet (see header).
 echo "Reading current network host from the database..."
 
-DB_SITEURL="$(db_query "SELECT option_value FROM wp_options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
-DB_DOMAIN="$(db_query "SELECT domain FROM wp_site ORDER BY id LIMIT 1;" 2>/dev/null)"
-[[ -z "$DB_DOMAIN" ]] && DB_DOMAIN="$(db_query "SELECT domain FROM wp_blogs ORDER BY blog_id LIMIT 1;" 2>/dev/null)"
+# Not every install uses the wp_ prefix. Ask wp-config.php, which is unaffected
+# by the option filtering described below, and fall back to wp_ if that fails.
+TABLE_PREFIX="$(wp_cli config get table_prefix 2>/dev/null | tr -d '\r')"
+[[ "$TABLE_PREFIX" =~ ^[A-Za-z0-9_]+$ ]] || TABLE_PREFIX="wp_"
+
+# Reading via SQL rather than `wp option get siteurl` is load-bearing for a
+# second reason beyond the bootstrap problem in the header: core filters
+# option_siteurl through _config_wp_siteurl, which returns the WP_SITEURL
+# constant when it is defined -- and wp-config-ddev.php always defines it. So
+# WP-CLI would report the DDEV URL back and the replacement would find nothing.
+DB_SITEURL="$(db_query "SELECT option_value FROM ${TABLE_PREFIX}options WHERE option_name='siteurl' LIMIT 1;" 2>/dev/null)"
+DB_DOMAIN="$(db_query "SELECT domain FROM ${TABLE_PREFIX}site ORDER BY id LIMIT 1;" 2>/dev/null)"
+[[ -z "$DB_DOMAIN" ]] && DB_DOMAIN="$(db_query "SELECT domain FROM ${TABLE_PREFIX}blogs ORDER BY blog_id LIMIT 1;" 2>/dev/null)"
 
 if [[ -z "$OLD_URL" ]]; then
   if [[ -n "$DB_SITEURL" ]]; then

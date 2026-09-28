@@ -203,18 +203,37 @@ Then pick a workflow below.
 You already have a WordPress codebase (cloned from Pantheon or GitHub) and want to
 give Claude a sandboxed local environment.
 
-1. Copy these into the root of your WP project:
-   - `.ddev/` (whole directory)
-   - `.local/` (whole directory)
-   - `.claude/` (whole directory)
-   - `.sass/` (if you compile SCSS)
-   - `.mcp.json`
-   - `CLAUDE.md` — **first time only.** After setup this file is yours to write in;
-     re-copying it on a later update would wipe what you added. The sandbox's own
-     rules ride along inside `.local/`, so updating `.local/` keeps them current on
-     its own. See [Project-specific instructions](#project-specific-instructions).
-   - `.gitignore` entries from this repo's `.gitignore` (merge into yours — and read
-     the note in there about the `wp-config.php` line, which you will want to drop).
+1. Install the scaffolding. Do not copy by hand — a blind copy overwrites the
+   project's own `wp-config.php`, `.gitignore`, `.htaccess` and `README.md`. Use
+   the installer, which knows which files belong to whom:
+
+   ```
+   ./.local/install-into-project.sh --dry-run /path/to/your-wp-project   # review
+   ./.local/install-into-project.sh /path/to/your-wp-project             # do it
+   ```
+
+   It sorts every file into three classes:
+
+   | | What | Behaviour |
+   | --- | --- | --- |
+   | **overwrite** | `.ddev/`, `.local/`, `.claude/`, `.sass/` runner, `.mcp.json`, `CLAUDE.md` | Rewritten on every run — this repo is the source of truth. Anything replaced is first copied to `.local/.install-backups/<timestamp>/`. |
+   | **seed** | `.local/DOC/DB_CHANGES.MD`, `.sass/SASS.settings.json` | Created once, then never touched. They accumulate project history. |
+   | **never** | `wp-config.php`, `.gitignore`, `.htaccess`, `README.md`, `.git/`, dotenv files, the Playwright secrets file, `.ddev/config.local.yaml`, `.local/.playwright-profile/` | The project owns these. |
+
+   It is re-runnable: that is how a project picks up a later fix to the sandbox.
+   Three things it does beyond copying —
+
+   - **Merges** the required rules into the project's `.gitignore` inside a marked
+     block, leaving everything outside that block alone.
+   - **Matches the database engine to production.** It reads `database: version:`
+     from `pantheon.upstream.yml` and, if it differs from this repo's pin, writes
+     `.ddev/config.local.yaml` — which DDEV merges over `config.yaml` and which
+     survives the next re-run.
+   - Installs this README as `.local/SANDBOX-README.md`, so the project's own
+     `README.md` is left as it is.
+
+   The file list comes from `git ls-files`, not a hardcoded array, so a file added
+   to this repo propagates without editing the installer.
 2. Run `./.local/site-control.sh`:
    - **Option 1** — Power on. Starts DDEV, creating `.ddev/config.yaml` first if it is
      somehow missing.
@@ -222,9 +241,12 @@ give Claude a sandboxed local environment.
      `wp-config-ddev.php` and then makes sure your own `wp-config.php` actually loads
      it. DDEV will not edit a `wp-config.php` it did not create — it only prints a
      suggestion — so this option inserts the include for you, above the
-     `wp-settings.php` require, behind a timestamped backup. If your `wp-config.php`
-     hardcodes `DB_NAME` / `DB_USER` / `DB_PASSWORD` / `DB_HOST`, comment those out:
-     whichever is defined first wins.
+     `wp-settings.php` require, behind a timestamped backup. It also detects and
+     repairs the stock Pantheon upstream's placeholder `DB_NAME` fallback, which
+     otherwise causes ["Error establishing a database
+     connection"](#error-establishing-a-database-connection-on-a-pantheon-project).
+     If your `wp-config.php` hardcodes `DB_NAME` / `DB_USER` / `DB_PASSWORD` /
+     `DB_HOST` anywhere else, comment those out: whichever is defined first wins.
    - **Option 4** — Import your SQL dump (drop a `.sql` / `.sql.gz` / `.zip` in the
      project root first), or **Option 5** to pull it from Pantheon.
    - **Option 6 / 7** — Search-replace your production URL, if content has it

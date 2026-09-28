@@ -136,6 +136,34 @@ recorded in `.local/DOC/DB_CHANGES.MD`.**
 the database through the dashboard, so the sandbox state can be understood and
 reproduced.
 
+## After importing a production database — deactivate these plugins
+
+An imported database carries production's **active-plugin list**, so plugins
+that are harmless on the live site become hostile in a sandbox. Immediately
+after any database import (`.local/site-control.sh` option 4 or 5), check these
+two and deactivate them if they are active. Do it without being asked.
+
+```
+ddev wp plugin list --status=active --field=name
+ddev wp plugin deactivate all-in-one-wp-security-and-firewall wp-mail-smtp
+```
+
+| Slug | Plugin name | Why it has to go |
+| --- | --- | --- |
+| `all-in-one-wp-security-and-firewall` | All-In-One Security (AIOS) | Carries over production's firewall state: login lockdowns, IP blocklists, brute-force limits and (optionally) a renamed login URL. On a fresh sandbox the admin login looks simply broken, and the lockout table is keyed to addresses that mean nothing here. |
+| `wp-mail-smtp` | WP Mail SMTP | Hooks `phpmailer_init` and points mail at a **real relay using production's credentials**, bypassing `sendmail` and therefore Mailpit. `00-sandbox-mail-guard.php` already forces mail back at `PHP_INT_MAX`, but that is a backstop — do not rely on it alone when you can just turn the plugin off. |
+
+Two caveats:
+
+- **Deactivating is a dashboard-level change, so it goes in
+  `.local/DOC/DB_CHANGES.MD`** like any other — append an entry.
+- If the task you are working on *is* one of these plugins, say so and leave it
+  active rather than silently disabling the thing under test.
+
+Slugs differ between projects. Confirm with `ddev wp plugin list` before acting
+on a project you have not seen, and do not deactivate anything else on your own
+initiative — ask first.
+
 ## Reading email the site sends — Mailpit
 
 DDEV ships Mailpit inside the web container and points PHP's `sendmail_path` at

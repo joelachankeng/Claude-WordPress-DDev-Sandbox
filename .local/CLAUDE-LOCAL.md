@@ -34,10 +34,34 @@ site.
 | Step debugging | `ddev xdebug on` |
 | What is this project's URL? | `ddev describe` |
 
-The interactive menu at **`.local/site-control.sh`** wraps the common jobs:
-start/stop, generating the DDEV WordPress config, importing a SQL file,
-importing the database from Pantheon, search-replace (single site and
-multisite), refreshing the admin user, and compiling or watching SASS.
+**`.local/site-control.sh`** wraps the common jobs. It takes commands, so run it
+directly — do not drive the menu by piping keystrokes into it.
+
+```
+.local/site-control.sh status
+.local/site-control.sh start
+.local/site-control.sh stop
+.local/site-control.sh wp-config
+.local/site-control.sh import-db --file=dump.sql.gz --yes
+.local/site-control.sh pull-db --site=<name> --env=live --yes
+.local/site-control.sh search-replace --dry-run
+.local/site-control.sh search-replace --old=https://example.com --yes
+.local/site-control.sh search-replace-multisite --yes
+.local/site-control.sh admin-user
+.local/site-control.sh sass-compile
+.local/site-control.sh --help
+```
+
+Two things to know:
+
+- **Anything that rewrites the database asks first, and refuses when there is no
+  terminal to ask on.** So `--yes` is required for `import-db`, `pull-db` and
+  `search-replace` when you run them. That refusal is deliberate: `read` against
+  a closed stdin returns empty and takes the default, which would otherwise let
+  a scripted import report success having silently done nothing.
+- Running it with **no arguments** opens the interactive menu, which is for the
+  user, not for you. `sass-watch` runs until interrupted — start it in the
+  background or not at all.
 
 ### WP-CLI just works
 
@@ -46,7 +70,7 @@ gone: DDEV's PHP already ships `variables_order=EGPCS`, so `$_ENV` is populated
 and there is no "Error establishing a database connection" failure mode to work
 around. If `ddev wp` genuinely cannot reach the database, the cause is almost
 always that `wp-config.php` does not include `wp-config-ddev.php` — run
-`.local/site-control.sh` option 3, which inserts that include for you.
+`.local/site-control.sh wp-config`, which inserts that include for you.
 
 ## Browsing the site: use `https://<project>.ddev.site`
 
@@ -112,7 +136,7 @@ workspace root.
 - **Email:** `admin@admin.com`
 - **Password:** `admin`
 
-If you cannot log in, run `.local/site-control.sh` option 7, which creates or
+If you cannot log in, run `.local/site-control.sh admin-user`, which creates or
 repairs that user (and falls back to direct SQL if WP-CLI is broken). By hand:
 
 ```
@@ -140,7 +164,7 @@ reproduced.
 
 An imported database carries production's **active-plugin list**, so plugins
 that are harmless on the live site become hostile in a sandbox. Immediately
-after any database import (`.local/site-control.sh` option 4 or 5), check these
+after any database import (`site-control.sh import-db` or `pull-db`), check these
 two and deactivate them if they are active. Do it without being asked.
 
 ```

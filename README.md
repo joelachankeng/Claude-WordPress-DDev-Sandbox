@@ -275,8 +275,8 @@ In both workflows the project root is the WordPress docroot.
 
 ## site-control.sh
 
-`./.local/site-control.sh` is the interactive control panel for the WordPress side of
-the sandbox. It prints a status header and a menu:
+`./.local/site-control.sh` is the control panel for the WordPress side of the
+sandbox. Run with no arguments it prints a status header and a menu:
 
 ```
   1) Power on  (ddev start)
@@ -291,6 +291,35 @@ the sandbox. It prints a status header and a menu:
  10) Watch SASS (Ctrl+C to stop)
   q) Quit
 ```
+
+Every option is also a command, which is how Claude drives it — a menu can only
+be automated by piping keystrokes at it, and that breaks the moment an option is
+reordered:
+
+```
+./.local/site-control.sh status
+./.local/site-control.sh start                                    # [1]
+./.local/site-control.sh stop                                     # [2]
+./.local/site-control.sh wp-config                                # [3]
+./.local/site-control.sh import-db --file=dump.sql.gz --yes       # [4]
+./.local/site-control.sh pull-db --site=NAME --env=live --yes     # [5]
+./.local/site-control.sh search-replace --old=URL [--new=URL]     # [6]
+./.local/site-control.sh search-replace-multisite                 # [7]
+./.local/site-control.sh admin-user                               # [8]
+./.local/site-control.sh sass-compile                             # [9]
+./.local/site-control.sh sass-watch                               # [10]
+./.local/site-control.sh --help
+```
+
+`--dry-run` works on either search-replace. `pull-db` also takes
+`--search-replace=single|multisite|skip` to chain the follow-up.
+
+**Anything that rewrites the database asks first, and refuses outright when
+there is no terminal to ask on** — so `--yes` is required when scripting
+`import-db`, `pull-db` and `search-replace`. That refusal matters: `read`
+against a closed stdin returns an empty string and takes the default, so without
+the check a scripted import would answer "no" to its own confirmation and then
+report success having done nothing at all.
 
 - **Power on/off** — `ddev start` / `ddev stop`. Note `stop` is per-project and keeps
   the database; `ddev poweroff` would stop every project on the machine. There is no

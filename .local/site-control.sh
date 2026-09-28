@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Interactive control panel for the DDEV WordPress sandbox.
+# Control panel for the DDEV WordPress sandbox: an interactive menu when run
+# with no arguments, one command per menu option otherwise (see usage at the
+# foot of this file, or --help).
 #
 #   - Start / stop this project's DDEV site
 #   - Generate the DDEV WordPress config and wire wp-config.php to it
@@ -38,19 +40,54 @@ PANTHEON_DUMP_REL=".ddev/.downloads/pantheon-db.sql.gz"
 # How old Pantheon's newest database backup may be before we make a new one.
 PANTHEON_BACKUP_MAX_AGE_SECONDS=86400   # 24 hours
 
+# -------------------- non-interactive options --------------------
+# Set by the argument parser at the foot of this file. Each action checks its
+# own option before prompting, so one function serves both the menu and the
+# command line rather than there being two code paths to keep in step.
+ASSUME_YES=0
+OPT_FILE=""
+OPT_SITE=""
+OPT_ENV=""
+OPT_OLD_URL=""
+OPT_NEW_URL=""
+OPT_AFTER_PULL=""   # single | multisite | skip
+OPT_DRY_RUN=0
+
 # -------------------- helpers --------------------
+# Returns 0 for yes, 1 for no. Two non-interactive cases matter:
+#
+#   --yes      answer yes without asking
+#   no tty     fail loudly instead of asking
+#
+# The second is the important one. `read` against a closed or empty stdin
+# returns immediately with an empty reply, which silently takes the default --
+# so a scripted `import-db` would have answered "no" to its own confirmation and
+# reported success having done nothing. Refusing is the honest outcome.
 confirm() {
   local prompt="${1:-Continue}"
   local default="${2:-N}"
   local hint reply
+  if (( ASSUME_YES )); then
+    echo "$prompt -> yes (--yes)"
+    return 0
+  fi
   case "${default^^}" in
     Y) hint="(Y/n)"; default="Y" ;;
     *) hint="(y/N)"; default="N" ;;
   esac
+  if [[ ! -t 0 ]]; then
+    echo "[ERROR] This needs an answer but stdin is not a terminal: $prompt" >&2
+    echo "        Pass --yes to answer yes, or run the menu interactively." >&2
+    return 1
+  fi
   read -rp "$prompt $hint: " reply
   reply="${reply:-$default}"
   [[ "${reply,,}" =~ ^(y|yes)$ ]]
 }
+
+# True when a value can be prompted for. Distinct from confirm(): --yes means
+# "assume yes", not "invent a site name".
+can_prompt() { [[ -t 0 ]]; }
 
 pause() { read -rp "Press Enter to return to the menu..." _; }
 
@@ -402,6 +439,30 @@ generate_wp_config() {
 import_database() {
   require_running || return 1
 
+  # --file bypasses the picker. Relative paths resolve against the project root,
+  # not the caller's cwd, so the same string works from anywhere.
+  if [[ -n "$OPT_FILE" ]]; then
+    local selected="$OPT_FILE"
+    [[ "$selected" = /* ]] || selected="$PROJECT_ROOT/$selected"
+    if [[ ! -f "$selected" ]]; then
+      echo "[ERROR] No such file: $selected" >&2
+      return 1
+    fi
+    echo "Selected: $(basename "$selected") ($(du -h "$selected" | cut -f1))"
+    if ! confirm "Replace the '$(project_name)' database with this dump?" N; then
+      echo "Cancelled."
+      return 1
+    fi
+    ddev import-db --file="$selected"
+    return $?
+  fi
+
+  if ! can_prompt; then
+    echo "[ERROR] No file given and stdin is not a terminal." >&2
+    echo "        Pass --file=<path>, or run the menu interactively." >&2
+    return 1
+  fi
+
   local files=()
   while IFS= read -r -d '' f; do
     files+=("$f")
@@ -484,33 +545,53 @@ import_database_pantheon() {
   fi
 
   local site
-  site="$(pantheon_site_from_config)"
-  if [[ -n "$site" ]]; then
-    echo "Pantheon site (from .ddev/config.local.yaml): $site"
-    local replacement
-    read -rp "Press Enter to use it, or type a different site name: " replacement
-    [[ -n "$replacement" ]] && site="$replacement"
+  if [[ -n "$OPT_SITE" ]]; then
+    site="$OPT_SITE"
   else
-    read -rp "Pantheon site name (blank to cancel): " site
-    [[ -z "$site" ]] && { echo "Cancelled."; return; }
+    site="$(pantheon_site_from_config)"
+    if [[ -n "$site" ]]; then
+      echo "Pantheon site (from .ddev/config.local.yaml): $site"
+      if can_prompt; then
+        local replacement
+        read -rp "Press Enter to use it, or type a different site name: " replacement
+        [[ -n "$replacement" ]] && site="$replacement"
+      fi
+    elif can_prompt; then
+      read -rp "Pantheon site name (blank to cancel): " site
+      [[ -z "$site" ]] && { echo "Cancelled."; return 1; }
+    else
+      echo "[ERROR] No Pantheon site known for this project." >&2
+      echo "        Pass --site=<name>, or run the menu interactively." >&2
+      return 1
+    fi
   fi
 
-  echo
-  echo "Which environment should the database come from?"
-  echo "  1) live   (production data)"
-  echo "  2) test"
-  echo "  3) dev"
-  echo "  4) other  (a multidev branch name)"
-  local env_choice env_name
-  read -rp "Choose [1-4, default 1]: " env_choice
-  case "${env_choice:-1}" in
-    1|"") env_name="live" ;;
-    2)    env_name="test" ;;
-    3)    env_name="dev" ;;
-    4)    read -rp "Multidev environment name: " env_name
-          [[ -z "$env_name" ]] && { echo "Cancelled."; return; } ;;
-    *)    echo "Invalid choice."; return ;;
-  esac
+  # Any string is a legal environment: live/test/dev plus multidev branch names.
+  # Terminus is the authority on whether it exists, so don't second-guess it here.
+  local env_name
+  if [[ -n "$OPT_ENV" ]]; then
+    env_name="$OPT_ENV"
+  elif can_prompt; then
+    echo
+    echo "Which environment should the database come from?"
+    echo "  1) live   (production data)"
+    echo "  2) test"
+    echo "  3) dev"
+    echo "  4) other  (a multidev branch name)"
+    local env_choice
+    read -rp "Choose [1-4, default 1]: " env_choice
+    case "${env_choice:-1}" in
+      1|"") env_name="live" ;;
+      2)    env_name="test" ;;
+      3)    env_name="dev" ;;
+      4)    read -rp "Multidev environment name: " env_name
+            [[ -z "$env_name" ]] && { echo "Cancelled."; return 1; } ;;
+      *)    echo "Invalid choice."; return 1 ;;
+    esac
+  else
+    env_name="live"
+    echo "Environment: live (default; override with --env=<name>)"
+  fi
 
   echo
   cat <<EOF
@@ -606,15 +687,27 @@ EOF
   echo "browsable now. Search-replace only matters for URLs hardcoded in content,"
   echo "and for a multisite network (wp_blogs / wp_site store bare domains)."
   echo
-  echo "  1) Run search-replace now (single site)"
-  echo "  2) Run search-replace now (multisite/network)"
-  echo "  3) Skip"
-  local sr
-  read -rp "Choose [1-3, default 3]: " sr
-  case "${sr:-3}" in
-    1) search_replace_urls ;;
-    2) search_replace_multisite ;;
-    *) echo "Skipped." ;;
+  local sr="${OPT_AFTER_PULL:-}"
+  if [[ -z "$sr" ]]; then
+    if can_prompt; then
+      echo "  1) Run search-replace now (single site)"
+      echo "  2) Run search-replace now (multisite/network)"
+      echo "  3) Skip"
+      read -rp "Choose [1-3, default 3]: " sr
+      case "${sr:-3}" in
+        1) sr="single" ;;
+        2) sr="multisite" ;;
+        *) sr="skip" ;;
+      esac
+    else
+      sr="skip"
+      echo "Skipping search-replace (override with --search-replace=single|multisite)."
+    fi
+  fi
+  case "$sr" in
+    single)    search_replace_urls ;;
+    multisite) search_replace_multisite ;;
+    *)         echo "Skipped." ;;
   esac
 }
 
@@ -636,24 +729,43 @@ search_replace_urls() {
       echo "---------------------"
     fi
     echo "Likely causes: wp-config.php doesn't include wp-config-ddev.php (menu"
-    echo "option 3), or WordPress core isn't present yet."
-    if confirm "Fix it and retry?" Y; then continue; else echo "Aborting."; return; fi
+    echo "option 3 / the wp-config command), or WordPress core isn't present yet."
+    # Retrying is only meaningful if a human can go and fix something between
+    # attempts. Under --yes confirm() always says yes, so this would spin.
+    if can_prompt && (( ! ASSUME_YES )) && confirm "Fix it and retry?" Y; then
+      continue
+    fi
+    echo "Aborting."
+    return 1
   done
 
   local old_url
-  old_url=$(wp_cli option get siteurl 2>/dev/null | tr -d '\r')
-  if [[ -z "$old_url" ]]; then
-    echo "Couldn't read the current site URL from the database."
-    read -rp "Enter the OLD URL to replace (blank to cancel): " old_url
-    [[ -z "$old_url" ]] && { echo "Cancelled."; return; }
+  if [[ -n "$OPT_OLD_URL" ]]; then
+    old_url="$OPT_OLD_URL"
+    echo "Old URL (from --old): $old_url"
   else
-    echo "Current site URL in the database: $old_url"
+    old_url=$(wp_cli option get siteurl 2>/dev/null | tr -d '\r')
+    if [[ -z "$old_url" ]]; then
+      echo "Couldn't read the current site URL from the database."
+      if ! can_prompt; then
+        echo "[ERROR] Pass --old=<url>, or run the menu interactively." >&2
+        return 1
+      fi
+      read -rp "Enter the OLD URL to replace (blank to cancel): " old_url
+      [[ -z "$old_url" ]] && { echo "Cancelled."; return 1; }
+    else
+      echo "Current site URL in the database: $old_url"
+    fi
   fi
 
   local new_url input
   new_url="$(primary_url)"
-  read -rp "New site URL [default: $new_url]: " input
-  new_url="${input:-$new_url}"
+  if [[ -n "$OPT_NEW_URL" ]]; then
+    new_url="$OPT_NEW_URL"
+  elif can_prompt; then
+    read -rp "New site URL [default: $new_url]: " input
+    new_url="${input:-$new_url}"
+  fi
 
   # Strip scheme and any trailing slash so both http:// and https:// forms of the
   # old host get replaced. A production dump is usually https while an older
@@ -672,16 +784,20 @@ search_replace_urls() {
   echo "Replacing across all tables (guid skipped):"
   echo "  https://$old_host  ->  $new_clean"
   echo "  http://$old_host   ->  $new_clean"
-  if ! confirm "Proceed?" Y; then echo "Cancelled."; return; fi
+  (( OPT_DRY_RUN )) && echo "  (dry run — nothing is written)"
+  if ! confirm "Proceed?" Y; then echo "Cancelled."; return 1; fi
+
+  local extra=()
+  (( OPT_DRY_RUN )) && extra+=(--dry-run)
 
   local rc=0
   wp_cli search-replace "https://$old_host" "$new_clean" \
-    --all-tables --skip-columns=guid --report-changed-only || rc=$?
+    --all-tables --skip-columns=guid --report-changed-only "${extra[@]+"${extra[@]}"}" || rc=$?
   wp_cli search-replace "http://$old_host" "$new_clean" \
-    --all-tables --skip-columns=guid --report-changed-only || rc=$?
+    --all-tables --skip-columns=guid --report-changed-only "${extra[@]+"${extra[@]}"}" || rc=$?
 
   if (( rc == 0 )); then
-    wp_cli cache flush >/dev/null 2>&1 || true
+    (( OPT_DRY_RUN )) || wp_cli cache flush >/dev/null 2>&1 || true
     echo "Done."
   else
     echo "[WARN] One or more passes exited non-zero (rc=$rc). Review the output above."
@@ -700,7 +816,21 @@ search_replace_multisite() {
     return 1
   fi
   require_running || return 1
-  bash "$mss"
+
+  # That script already takes [OLD] [NEW] --dry-run --yes, so forward rather
+  # than reimplementing. Positional, so OLD has to be present to pass NEW.
+  local args=()
+  if [[ -n "$OPT_OLD_URL" ]]; then
+    args+=("$OPT_OLD_URL")
+    [[ -n "$OPT_NEW_URL" ]] && args+=("$OPT_NEW_URL")
+  elif [[ -n "$OPT_NEW_URL" ]]; then
+    echo "[ERROR] --new needs --old as well for a multisite replace." >&2
+    return 1
+  fi
+  (( OPT_DRY_RUN )) && args+=(--dry-run)
+  (( ASSUME_YES ))  && args+=(--yes)
+
+  bash "$mss" "${args[@]+"${args[@]}"}"
 }
 
 # -------------------- 8: admin user --------------------
@@ -872,4 +1002,136 @@ EOF
   done
 }
 
-main_menu
+# -------------------- command line --------------------
+usage() {
+  cat <<'USAGE'
+Sandbox site control.
+
+  site-control.sh                  the interactive menu
+  site-control.sh <command> [...]  run one action and exit
+
+Commands (the menu option they correspond to is in brackets):
+
+  start                     [1]  ddev start
+  stop                      [2]  ddev stop
+  wp-config                 [3]  generate wp-config-ddev.php and wire
+                                 wp-config.php to it
+  import-db --file=PATH     [4]  replace the database with a SQL dump
+  pull-db                   [5]  replace the database from Pantheon
+  search-replace            [6]  rewrite site URLs (single site)
+  search-replace-multisite  [7]  rewrite site URLs (network)
+  admin-user                [8]  create or repair the admin/admin user
+  sass-compile              [9]  compile SCSS once
+  sass-watch               [10]  watch SCSS (runs until interrupted)
+  status                         print the status panel and exit
+
+Options:
+  -y, --yes                 answer yes to every confirmation
+  -n, --dry-run             search-replace: report changes, write nothing
+      --file=PATH           import-db: the dump to load, absolute or relative
+                            to the project root
+      --site=NAME           pull-db: the Pantheon site
+                            (default: the one saved in .ddev/config.local.yaml)
+      --env=NAME            pull-db: live | test | dev | a multidev branch
+                            (default: live)
+      --search-replace=WHAT pull-db: single | multisite | skip, run afterwards
+                            (default: skip)
+      --old=URL             search-replace: the URL to replace
+                            (default: the siteurl option in the database)
+      --new=URL             search-replace: the URL to write
+                            (default: this project's DDEV URL)
+  -h, --help                this text
+
+Anything that would change the database asks first. Without a terminal to ask
+on, the action refuses rather than guessing -- so --yes is required when
+scripting those.
+
+Examples:
+  site-control.sh start
+  site-control.sh import-db --file=dump.sql.gz --yes
+  site-control.sh pull-db --site=my-site --env=live --yes
+  site-control.sh search-replace --old=https://example.com --yes
+USAGE
+}
+
+# No arguments at all: the menu, exactly as before.
+if [[ $# -eq 0 ]]; then
+  main_menu
+  exit 0
+fi
+
+COMMAND=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -y|--yes)             ASSUME_YES=1 ;;
+    -n|--dry-run)         OPT_DRY_RUN=1 ;;
+    -h|--help|help)       usage; exit 0 ;;
+    --file=*)             OPT_FILE="${1#*=}" ;;
+    --site=*)             OPT_SITE="${1#*=}" ;;
+    --env=*)              OPT_ENV="${1#*=}" ;;
+    --old=*)              OPT_OLD_URL="${1#*=}" ;;
+    --new=*)              OPT_NEW_URL="${1#*=}" ;;
+    --search-replace=*)   OPT_AFTER_PULL="${1#*=}" ;;
+    # The space-separated forms, because typing --file dump.sql is a reflex.
+    --file|--site|--env|--old|--new|--search-replace)
+      if [[ $# -lt 2 ]]; then
+        echo "[ERROR] $1 needs a value." >&2
+        exit 2
+      fi
+      case "$1" in
+        --file)           OPT_FILE="$2" ;;
+        --site)           OPT_SITE="$2" ;;
+        --env)            OPT_ENV="$2" ;;
+        --old)            OPT_OLD_URL="$2" ;;
+        --new)            OPT_NEW_URL="$2" ;;
+        --search-replace) OPT_AFTER_PULL="$2" ;;
+      esac
+      shift
+      ;;
+    -*)
+      echo "[ERROR] Unknown option: $1" >&2
+      echo "        Run 'site-control.sh --help' for the list." >&2
+      exit 2
+      ;;
+    *)
+      if [[ -n "$COMMAND" ]]; then
+        echo "[ERROR] Unexpected argument: $1 (command '$COMMAND' already given)" >&2
+        exit 2
+      fi
+      COMMAND="$1"
+      ;;
+  esac
+  shift
+done
+
+if [[ -n "$OPT_AFTER_PULL" ]]; then
+  case "$OPT_AFTER_PULL" in
+    single|multisite|skip) ;;
+    *) echo "[ERROR] --search-replace must be single, multisite or skip." >&2; exit 2 ;;
+  esac
+fi
+
+case "$COMMAND" in
+  start|up)                 power_on ;;
+  stop|down)                power_off ;;
+  wp-config)                generate_wp_config ;;
+  import-db)                import_database ;;
+  pull-db)                  import_database_pantheon ;;
+  search-replace)           search_replace_urls ;;
+  search-replace-multisite) search_replace_multisite ;;
+  admin-user)               create_admin_user ;;
+  sass-compile)             compile_sass ;;
+  sass-watch)               watch_sass ;;
+  status)                   print_status ;;
+  "")
+    echo "[ERROR] No command given." >&2
+    usage >&2
+    exit 2
+    ;;
+  *)
+    echo "[ERROR] Unknown command: $COMMAND" >&2
+    usage >&2
+    exit 2
+    ;;
+esac
+exit $?

@@ -31,7 +31,7 @@ DO_BACKUP=1
 TARGET=""
 
 # Files the target project owns. Never written, never overwritten.
-#   .gitignore   is merged instead (see write_gitignore_block)
+#   .gitignore   gains the sandbox rules instead (see write_gitignore_rules)
 #   README.md    is installed as .local/SANDBOX-README.md instead
 #   .htaccess    the project has its own, and it is inert under nginx anyway
 #   the dotenv example existed only for the old container's OAuth token
@@ -39,9 +39,6 @@ NEVER_COPY=( .gitignore .htaccess README.md ".env.example" )
 
 # Copied only when absent, because they become project history once in use.
 SEED_ONLY=( .local/DOC/DB_CHANGES.MD .sass/SASS.settings.json )
-
-GITIGNORE_BEGIN="# >>> claude-ddev-sandbox >>>"
-GITIGNORE_END="# <<< claude-ddev-sandbox <<<"
 
 usage() {
     cat <<USAGE
@@ -165,74 +162,101 @@ if [[ -n "$PANTHEON_DB" && -n "$SANDBOX_DB" && "$PANTHEON_DB" != "$SANDBOX_DB" \
 fi
 
 # ------------------------------------------------------------------ gitignore
+#
+# Rules go under the project's own "# Local Sandbox #" heading, in the same
+# style as the rest of the file, and only when they are not already present.
+# Deliberately no marker block and no explanatory comments in the output: a
+# .gitignore belongs to the project, so the diff should be the rules themselves
+# and nothing else.
+#
+# What that trades away: this is purely additive. A rule later dropped from the
+# sandbox is not retracted from a project that already took it. Stale ignore
+# rules cost nothing, so the tidier file wins.
+GITIGNORE_HEADING="# Local Sandbox #"
+GITIGNORE_UNDERLINE="################"
 
-gitignore_block() {
-    cat <<BLOCK
-$GITIGNORE_BEGIN
-# Managed by .local/install-into-project.sh. Edits inside this block are lost on
-# the next run; put your own rules outside it.
-.claude
-.cursorignore
-.ddev
-.local
-.mcp.json
-CLAUDE.md
-.sass
-!.sass/SASS.settings.json
-!.sass/SASS.settings.example.json
-.playwright-mcp
+# Order matters: .sass has to precede its own negations.
+SANDBOX_RULES=(
+    .claude
+    .cursorignore
+    .ddev
+    .local
+    .mcp.json
+    CLAUDE.md
+    .sass
+    '!.sass/SASS.settings.json'
+    '!.sass/SASS.settings.example.json'
+    .playwright-mcp
+    .env
+    '.env.*'
+    '!.env.example'
+    wp-config-ddev.php
+    /wp-content/mu-plugins/local-mu-plugins/
+    /wp-content/mu-plugins/00-local-mu-plugins.php
+    '/wp-content/mu-plugins/[0-9][0-9]-sandbox-*.php'
+)
 
-# Credentials never belong in the project's history. The sandbox keeps its own
-# under .local/, which is already ignored above; this covers a stray one at the
-# repository root.
-.env
-.env.*
-!.env.example
-
-# DDEV regenerates this on every start and marks it #ddev-generated.
-# wp-config.php itself is the project's own file and stays in version control.
-wp-config-ddev.php
-
-# Installed on each container start from .local/wp-mu-plugins/.
-# Assumes the Pantheon layout, with the docroot at the repository root.
-/wp-content/mu-plugins/local-mu-plugins/
-/wp-content/mu-plugins/00-local-mu-plugins.php
-/wp-content/mu-plugins/[0-9][0-9]-sandbox-*.php
-$GITIGNORE_END
-BLOCK
+# A rule counts as present anywhere in the file, not only under our heading.
+# These projects already carry some of these rules under other headings, and
+# repeating one there would be noise.
+missing_gitignore_rules() {
+    local gi="$TARGET/.gitignore" rule
+    for rule in "${SANDBOX_RULES[@]}"; do
+        if [[ -f "$gi" ]] && awk -v r="$rule" '
+            { line = $0; sub(/^[ \t]+/, "", line); sub(/[ \t]+$/, "", line) }
+            line == r { found = 1; exit }
+            END { exit(found ? 0 : 1) }
+        ' "$gi"; then
+            continue
+        fi
+        printf '%s\n' "$rule"
+    done
 }
 
-gitignore_action() {
-    local gi="$TARGET/.gitignore"
-    [[ -f "$gi" ]] || { echo "create"; return; }
-    if grep -qF "$GITIGNORE_BEGIN" "$gi"; then
-        local current
-        current="$(awk -v b="$GITIGNORE_BEGIN" -v e="$GITIGNORE_END" \
-            'index($0,b){f=1} f{print} index($0,e){f=0}' "$gi")"
-        if [[ "$current" == "$(gitignore_block)" ]]; then echo "current"; else echo "replace"; fi
-    else
-        echo "append"
+write_gitignore_rules() {
+    local gi="$TARGET/.gitignore" tmp rules
+    [[ ${#GITIGNORE_MISSING[@]} -gt 0 ]] || return 0
+
+    # No heading yet: start the section at the end of the file.
+    if [[ ! -f "$gi" ]] || ! grep -qxF "$GITIGNORE_HEADING" "$gi"; then
+        {
+            [[ -s "$gi" ]] && printf '\n'
+            printf '%s\n%s\n' "$GITIGNORE_HEADING" "$GITIGNORE_UNDERLINE"
+            printf '%s\n' "${GITIGNORE_MISSING[@]}"
+        } >> "$gi"
+        return 0
     fi
+
+    rules="$(mktemp)" || return 1
+    tmp="$(mktemp)"   || { rm -f "$rules"; return 1; }
+    printf '%s\n' "${GITIGNORE_MISSING[@]}" > "$rules"
+
+    # Append inside the existing section, after its last rule. A section runs
+    # until the next heading, which in this file's style is a line whose
+    # successor is a row of '#'.
+    awk -v hdr="$GITIGNORE_HEADING" -v rulesfile="$rules" '
+        { line[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++) if (line[i] == hdr) { h = i; break }
+            stop = NR
+            if (h) {
+                for (i = h + 2; i < NR; i++) {
+                    if (line[i] ~ /^#/ && line[i + 1] ~ /^#+$/) { stop = i - 1; break }
+                }
+                while (stop > h && line[stop] ~ /^[ \t]*$/) stop--
+            }
+            for (i = 1; i <= stop; i++) print line[i]
+            while ((getline r < rulesfile) > 0) print r
+            close(rulesfile)
+            for (i = stop + 1; i <= NR; i++) print line[i]
+        }
+    ' "$gi" > "$tmp" || { rm -f "$tmp" "$rules"; return 1; }
+
+    cat "$tmp" > "$gi"
+    rm -f "$tmp" "$rules"
 }
 
-write_gitignore_block() {
-    local gi="$TARGET/.gitignore" action="$1" tmp
-    case "$action" in
-        current) return 0 ;;
-        create)  gitignore_block > "$gi" ;;
-        append)  { [[ -s "$gi" ]] && printf '\n'; gitignore_block; } >> "$gi" ;;
-        replace)
-            tmp="$(mktemp)"
-            awk -v b="$GITIGNORE_BEGIN" -v e="$GITIGNORE_END" \
-                'index($0,b){skip=1} !skip{print} index($0,e){skip=0}' "$gi" > "$tmp"
-            gitignore_block >> "$tmp"
-            cat "$tmp" > "$gi"
-            rm -f "$tmp"
-            ;;
-    esac
-}
-
-GITIGNORE_ACTION="$(gitignore_action)"
+mapfile -t GITIGNORE_MISSING < <(missing_gitignore_rules)
 
 # ------------------------------------------------------------------ the plan
 
@@ -267,12 +291,12 @@ say "Docs:"
 say "    write   .local/SANDBOX-README.md   (the project's own README.md is untouched)"
 
 say
-case "$GITIGNORE_ACTION" in
-    create)  say ".gitignore: create, with the sandbox block" ;;
-    append)  say ".gitignore: append the sandbox block (existing rules untouched)" ;;
-    replace) say ".gitignore: refresh the sandbox block (rules outside it untouched)" ;;
-    current) say ".gitignore: sandbox block already current" ;;
-esac
+if [[ ${#GITIGNORE_MISSING[@]} -eq 0 ]]; then
+    say ".gitignore: already carries every sandbox rule"
+else
+    say ".gitignore: add ${#GITIGNORE_MISSING[@]} rule(s) under '$GITIGNORE_HEADING'"
+    for rule in "${GITIGNORE_MISSING[@]}"; do say "    $rule"; done
+fi
 
 if [[ $WRITE_DB_OVERRIDE -eq 1 ]]; then
     say
@@ -309,7 +333,7 @@ if [[ $DRY_RUN -eq 1 ]]; then
 fi
 
 nothing_to_do=0
-if [[ ${#changed[@]} -eq 0 && ${#to_seed[@]} -eq 0 && "$GITIGNORE_ACTION" == "current" \
+if [[ ${#changed[@]} -eq 0 && ${#to_seed[@]} -eq 0 && ${#GITIGNORE_MISSING[@]} -eq 0 \
       && $WRITE_DB_OVERRIDE -eq 0 ]]; then
     nothing_to_do=1
 fi
@@ -347,7 +371,7 @@ mkdir -p "$TARGET/.local"
 cp "$SRC/README.md" "$TARGET/.local/SANDBOX-README.md"
 chmod 644 "$TARGET/.local/SANDBOX-README.md"
 
-write_gitignore_block "$GITIGNORE_ACTION"
+write_gitignore_rules
 
 if [[ $WRITE_DB_OVERRIDE -eq 1 ]]; then
     mkdir -p "$TARGET/.ddev"

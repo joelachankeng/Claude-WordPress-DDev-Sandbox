@@ -223,8 +223,13 @@ give Claude a sandboxed local environment.
    It is re-runnable: that is how a project picks up a later fix to the sandbox.
    Three things it does beyond copying —
 
-   - **Merges** the required rules into the project's `.gitignore` inside a marked
-     block, leaving everything outside that block alone.
+   - **Adds the needed rules to the project's `.gitignore`**, under its own
+     `# Local Sandbox #` heading (created at the end of the file if absent), in the
+     same bare style as the rest of the file — no marker block, no commentary. A
+     rule already present anywhere in the file is not repeated, so on a project
+     that has hosted the sandbox before the diff is usually two or three lines.
+     Note this is purely additive: a rule later dropped from the sandbox is not
+     retracted from a project that already took it.
    - **Matches the database engine to production.** It reads `database: version:`
      from `pantheon.upstream.yml` and, if it differs from this repo's pin, writes
      `.ddev/config.local.yaml` — which DDEV merges over `config.yaml` and which
